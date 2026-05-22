@@ -6,56 +6,77 @@ sonic-buildimage is the master build system for SONiC (Software for Open Network
 
 ## Architecture
 
-```
-sonic-buildimage/
-├── device/           # Platform-specific device configurations and plugins
-├── dockers/          # Dockerfile definitions for all SONiC containers
-├── files/            # Configuration files, scripts, and templates
-├── installer/        # ONIE installer scripts
-├── platform/         # Platform-specific build rules and configurations
-├── rules/            # Makefile rules for building individual components
-├── scripts/          # Build helper scripts
-├── sonic-slave-*/    # Build environment container definitions (per Debian version)
-├── src/              # Source code and submodules for SONiC components
-├── .azure-pipelines/ # CI/CD pipeline definitions
-├── Makefile          # Top-level build entry point
-└── .github/          # GitHub Actions and PR templates
+The build flows top-down: `Makefile` → `Makefile.work` (enters Docker build slave) → `slave.mk` (orchestrates all targets inside the container).
+
+- **`rules/`** — Each component has a `.mk` file (build definition) and a `.dep` file (dependency graph). The `.mk` file declares the package variable, its `_SRC_PATH`, `_DEPENDS`, `_RDEPENDS`, and registers it into a build category.
+- **`dockers/`** — Dockerfile.j2 templates for each SONiC service container. Built via rules in `rules/docker-*.mk`.
+- **`device/`** — Per-platform device configs: `device/<vendor>/<platform>/`. Contains plugins, LED configs, platform.json, hwsku dirs.
+- **`platform/`** — Platform-specific build rules and kernel modules (e.g., `platform/broadcom/`, `platform/mellanox/`).
+- **`src/`** — Git submodules for SONiC components. **Do NOT modify files here directly** — changes go to the respective submodule repos.
+- **`sonic-slave-*`** — Dockerfiles for the build environment containers (one per Debian release).
+- **`slave.mk`** — The main build orchestrator. Defines path variables (`DEBS_PATH`, `PYTHON_WHEELS_PATH`, etc.) and includes all rules.
+
+### Build Target Categories (in `.mk` files)
+
+Packages register into one of these categories which determines how they're built:
+
+| Category | Meaning |
+|----------|---------|
+| `SONIC_DPKG_DEBS` | Built from source via `dpkg-buildpackage` (has `_SRC_PATH`) |
+| `SONIC_MAKE_DEBS` | Built from source via custom Makefile |
+| `SONIC_ONLINE_DEBS` | Downloaded from a URL |
+| `SONIC_DOCKER_IMAGES` | Docker images built from Dockerfile.j2 |
+| `SONIC_INSTALL_DOCKER_IMAGES` | Docker images included in the final NOS image |
+
+### Rules `.mk` File Pattern
+
+```makefile
+# Package variable = filename
+SWSS = swss_1.0.0_$(CONFIGURED_ARCH).deb
+$(SWSS)_SRC_PATH = $(SRC_PATH)/sonic-swss
+$(SWSS)_DEPENDS += $(LIBSAIREDIS_DEV) $(LIBSWSSCOMMON_DEV)
+$(SWSS)_RDEPENDS += $(LIBSAIREDIS) $(LIBSWSSCOMMON)
+SONIC_DPKG_DEBS += $(SWSS)
 ```
 
-### Key Concepts
-- **Rules system**: Each component has a `.mk` file in `rules/` defining how to build it
-- **Docker containers**: SONiC services run in Docker containers defined in `dockers/`
-- **Platform abstraction**: `device/` and `platform/` directories abstract hardware differences
-- **Build slaves**: Builds run inside Debian-versioned containers (bookworm, bullseye, etc.)
-- **Submodules**: Most SONiC components are git submodules under `src/`
+For Docker images:
+```makefile
+DOCKER_ORCHAGENT_STEM = docker-orchagent
+DOCKER_ORCHAGENT = $(DOCKER_ORCHAGENT_STEM).gz
+$(DOCKER_ORCHAGENT)_PATH = $(DOCKERS_PATH)/$(DOCKER_ORCHAGENT_STEM)
+$(DOCKER_ORCHAGENT)_DEPENDS += $(SWSS)
+$(DOCKER_ORCHAGENT)_LOAD_DOCKERS += $(DOCKER_SWSS_LAYER_TRIXIE)
+SONIC_DOCKER_IMAGES += $(DOCKER_ORCHAGENT)
+SONIC_INSTALL_DOCKER_IMAGES += $(DOCKER_ORCHAGENT)
+```
 
 ## Language & Style
 
 - **Primary languages**: Makefile, Shell (bash), Python, Jinja2 templates
-- **Makefile style**: Use tabs for indentation in Makefiles (GNU Make requirement)
+- **Makefile style**: Use tabs for indentation (GNU Make requirement)
 - **Shell scripts**: Use `#!/bin/bash`, 4-space indentation
 - **Python**: Follow PEP 8, 4-space indentation
-- **Naming**: Use snake_case for variables and functions in shell/Python; UPPER_CASE for Make variables
+- **Naming**: snake_case for variables/functions in shell/Python; UPPER_CASE for Make variables
 
-## Build Instructions
+## Build Commands
 
 ```bash
-# Clone with submodules
-git clone --recurse-submodules https://github.com/sonic-net/sonic-buildimage.git
-cd sonic-buildimage
-
-# Initialize build environment
+# Initialize and configure
 make init
-
-# Configure for a specific platform
 make configure PLATFORM=vs  # Virtual Switch for testing
-# Other platforms: broadcom, mellanox, marvell-teralynx, etc.
 
-# Build the image
+# Build full image
 make SONIC_BUILD_JOBS=4 target/sonic-vs.img.gz
 
-# Build specific component
+# Build a single .deb package
 make target/debs/bookworm/swss_1.0.0_amd64.deb
+
+# Build a single Docker image
+make target/docker-orchagent.gz
+
+# Clean everything
+make clean    # remove build artifacts
+make reset    # full reset including Docker images
 ```
 
 ### Build Environment Requirements
@@ -63,54 +84,42 @@ make target/debs/bookworm/swss_1.0.0_amd64.deb
 - Docker installed and running
 - KVM virtualization support (for some builds)
 
+### Key Build Variables (`rules/config`)
+
+- `SONIC_CONFIG_BUILD_JOBS` — Parallel package build jobs (auto-detected)
+- `SONIC_CONFIG_MAKE_JOBS` — Make -j within each package (defaults to nproc)
+- `ENABLE_*` — Feature toggles (e.g., `ENABLE_ZTP`, `ENABLE_SYNCD_RPC`)
+- `INCLUDE_*` — Component inclusion flags (e.g., `INCLUDE_SNMP`, `INCLUDE_NAT`)
+- `DEFAULT_KERNEL_PROCURE_METHOD` — `build` or `download`
+
 ## Testing
 
 - **VS (Virtual Switch)** platform is the primary testing platform
 - CI runs on Azure Pipelines (`.azure-pipelines/`)
 - Test images are built with `PLATFORM=vs`
-- Integration tests run against VS images in sonic-mgmt repo
-- Use `pytest.ini` at the root for Python test configuration
+- Integration tests run against VS images in the sonic-mgmt repo
+- Python tests use pytest; `pytest.ini` at root sets rootdir
 
 ## PR Guidelines
 
 - **Commit format**: `[component/folder]: Description of changes`
-- **Signed-off-by**: All commits MUST include `Signed-off-by: Your Name <email>` (DCO requirement)
-- **CLA**: Sign the Linux Foundation EasyCLA before contributing
-- **Single logical change per PR**: Isolate each commit to one component/bugfix/feature
-- **Submodule updates**: When updating a submodule, reference the PR in the submodule repo
-- **PR description**: Include what changed, why, and how to test
-- **PR description template**: Fill out all sections of the [PR template](pull_request_template.md) when submitting a pull request:
-  - **Why I did it**: Explain motivation and context for the change
-  - **Work item tracking**: Microsoft ADO number if applicable
-  - **How I did it**: Describe the implementation approach
-  - **How to verify it**: Provide steps or commands to test the change
-  - **Which release branch to backport**: Check applicable release branches if this is a fix
-  - **Tested branch**: Provide the tested image version
-  - **Description for the changelog**: One-line summary for the changelog
-  - **Link to config_db schema for YANG module changes**: If modifying YANG models, link to the relevant section
+- **Signed-off-by**: All commits MUST include `Signed-off-by: Your Name <email>` (DCO requirement, use `git commit -s`)
+- **Single logical change per PR**
+- **Submodule updates**: Reference the PR in the submodule repo
+- **PR template sections** (all required): Why I did it, Work item tracking, How I did it, How to verify it, Which release branch to backport, Tested branch, Description for the changelog
 
 ## Common Patterns
 
-- **Adding a new package**: Create a `.mk` file in `rules/`, add source in `src/`
-- **Adding a Docker container**: Create Dockerfile in `dockers/`, add build rule in `rules/`
-- **Platform support**: Add platform config in `device/<vendor>/`, build rules in `platform/`
-- **Version pinning**: Dependencies are version-pinned in rules files
-- **Build flags**: Use `ENABLE_*` and `INCLUDE_*` variables to toggle features
-
-## Dependencies
-
-- All SONiC repos are submodules (sonic-swss, sonic-sairedis, sonic-utilities, etc.)
-- Debian base system (bookworm/bullseye)
-- Docker for containerized builds
-- Azure Pipelines for CI/CD
+- **Adding a new package**: Create `rules/<pkg>.mk` and `rules/<pkg>.dep`, add source in `src/`
+- **Adding a Docker container**: Create `dockers/<name>/Dockerfile.j2`, add `rules/docker-<name>.mk` and `.dep`
+- **Platform support**: Add config in `device/<vendor>/<platform>/`, build rules in `platform/<vendor>/`
+- **Feature flags**: Add `ENABLE_*` or `INCLUDE_*` in `rules/config`, gate with `ifeq` in `.mk` files
 
 ## Gotchas
 
 - **Build times**: Full builds take 2-6 hours; use `SONIC_BUILD_JOBS` to parallelize
-- **Disk space**: Builds require 100+ GiB; clean with `make clean` or `make reset`
+- **Disk space**: Builds require 100+ GiB
 - **Submodule versions**: Always check that submodule pins are correct before building
-- **Docker cache**: Build uses Docker layer caching; `make clean` to force rebuild
-- **Branch compatibility**: Component branches must match buildimage branch (e.g., master ↔ master)
-- **Make variables**: Many build options are controlled by variables in `rules/config`
-- **Platform differences**: Some features are platform-specific; check `rules/config` for `ENABLE_*` flags
-- **Do NOT modify files in `src/` directly**: Changes should go to the respective submodule repos
+- **Branch compatibility**: Component branches must match buildimage branch (master ↔ master)
+- **Do NOT modify `src/` directly**: Changes go to the respective submodule repos, then update the submodule pin here
+- **Debian version matters**: Build outputs go to `target/debs/<codename>/` (bookworm, bullseye, etc.). The active codename is determined by the build slave container.
