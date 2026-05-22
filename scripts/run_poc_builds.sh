@@ -155,6 +155,7 @@ CACHE_DIR="/tmp/sonic-dpkg-cache"
 OUTPUT_DIR="$REPO_ROOT/poc-results"
 BUILD_TARGET=""
 BUILD_JOBS=""
+EXTRA_MAKE_OPTS=""
 DOCKER_PRUNE=false
 VERSION_CONTROL="all"
 BUILDS="A,B,C"
@@ -176,6 +177,7 @@ usage() {
     echo "  --version-control MODE none|all (default: all — pins external deps)"
     echo "  --builds BUILDS        Comma-separated: A,B,C (default: A,B,C)"
     echo "  --skip-build-a         Shortcut for --builds B,C"
+    echo "  --make-opts 'K=V ...'  Extra make variables (e.g., 'INCLUDE_FIPS=n')"
     echo "  --dry-run              Show plan without executing"
     echo "  --continue-from BUILD  Resume from build A, B, or C"
     echo "  --help                 Show this help"
@@ -193,6 +195,7 @@ while [[ $# -gt 0 ]]; do
         --version-control) VERSION_CONTROL="$2"; shift 2 ;;
         --builds) BUILDS="$2"; shift 2 ;;
         --skip-build-a) BUILDS="B,C"; shift ;;
+        --make-opts) EXTRA_MAKE_OPTS="$2"; shift 2 ;;
         --dry-run) DRY_RUN=true; shift ;;
         --continue-from) CONTINUE_FROM="$2"; shift 2 ;;
         --help|-h) usage ;;
@@ -402,6 +405,13 @@ run_build() {
 
     if [[ -n "$BUILD_JOBS" ]]; then
         make_args+=("SONIC_BUILD_JOBS=$BUILD_JOBS")
+    fi
+
+    # Add extra make options (e.g., INCLUDE_FIPS=n)
+    if [[ -n "$EXTRA_MAKE_OPTS" ]]; then
+        for opt in $EXTRA_MAKE_OPTS; do
+            make_args+=("$opt")
+        done
     fi
 
     # Determine build target
