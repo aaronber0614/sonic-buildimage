@@ -124,3 +124,6 @@ sources.list.*
 
 # Generated mirror configs
 apt-retries-count
+SONiC Build Infra.pdf
+SONiC Build Infra.pptx
+poc-run.log
