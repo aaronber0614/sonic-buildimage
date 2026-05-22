@@ -405,11 +405,11 @@ run_build() {
     fi
 
     # Determine build target
-    local target="${BUILD_TARGET:-target/debs/${BLDENV}/}"
-    if [[ -z "$BUILD_TARGET" ]]; then
-        # Default: build all packages (not the full image, for faster PoC)
-        target=""
-        log_info "Building all default targets (full package build)"
+    local target="${BUILD_TARGET:-}"
+    if [[ -z "$target" ]]; then
+        # Default: build all .deb packages for the configured environment
+        target="target/debs/${BLDENV}/"
+        log_info "Building all packages (target/debs/${BLDENV}/)"
     else
         log_info "Building target: $target"
     fi
