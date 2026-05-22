@@ -69,7 +69,7 @@ RUN eatmydata apt-get install -y python3-minimal:$arch python3.11:$arch python3:
 RUN apt-get download python3-distutils && eatmydata dpkg --force-all -i python3-distutils*
 RUN apt-get download python3-pip && eatmydata dpkg --force-all -i python3-pip*
 RUN which pip3 && pip3 install enum34
-RUN pip3 install --break-system-packages virtualenv
+RUN pip3 install virtualenv
 
 # Create target arm python3 virtual environments with all required packages installed
 RUN mkdir /python_virtualenv
@@ -552,7 +552,7 @@ RUN eatmydata apt-get install -y golang-go \
  && ln -sf /usr/lib/go-1.19 /usr/local/go
 {%- endif %}
 
-RUN pip3 install --break-system-packages --upgrade pip==24.2
+RUN pip3 install --upgrade pip==24.2
 RUN apt-get purge -y python3-pip
 
 {%- if CONFIGURED_ARCH == "armhf" %}
@@ -566,56 +566,56 @@ RUN patch -p1 -i /disable-non-manylinux.patch /usr/local/lib/python3.11/dist-pac
 {%- endif %}
 
 # For building sonic-utilities
-RUN pip3 install --break-system-packages fastentrypoints mock
+RUN pip3 install fastentrypoints mock
 
 # For DASH BMv2
 # Exclude jsonpath_ng 1.8.0 because it causes DASH pipeline failures
 # In version 1.8.0, dict is flattened to a list, which causes type error in DASH.
-RUN pip3 install --break-system-packages jsonpath_ng!=1.8.0
-RUN pip3 install --break-system-packages pyyaml-include
+RUN pip3 install jsonpath_ng!=1.8.0
+RUN pip3 install pyyaml-include
 
 # For building sonic_ycabled
 # Note: Match version in bookworm
-RUN pip3 install --break-system-packages grpcio==1.51.1 grpcio-tools==1.51.1 --no-build-isolation
+RUN pip3 install grpcio==1.51.1 grpcio-tools==1.51.1 --no-build-isolation
 
 # For running Python unit tests
-RUN pip3 install --break-system-packages pytest-runner==5.2
-RUN pip3 install --break-system-packages mockredispy==2.9.3
-RUN pip3 install --break-system-packages pyfakefs
+RUN pip3 install pytest-runner==5.2
+RUN pip3 install mockredispy==2.9.3
+RUN pip3 install pyfakefs
 
-RUN pip3 install --break-system-packages pillow==10.0.0
+RUN pip3 install pillow==10.0.0
 
 # For p4 build
-RUN pip3 install --break-system-packages \
+RUN pip3 install \
          ctypesgen==1.0.2 \
          crc16
 
 # For nvidia-bluefield sdk
-RUN pip3 install --break-system-packages ctypeslib2 clang==14
+RUN pip3 install ctypeslib2 clang==14
 
 # For sonic config engine testing
 # Install pyangbind here, outside sonic-config-engine dependencies, as pyangbind causes enum34 to be installed.
 # enum34 causes Python 're' package to not work properly as it redefines an incompatible enum.py module
 # https://github.com/robshakir/pyangbind/issues/232
-RUN pip3 install --break-system-packages pyangbind==0.8.2
+RUN pip3 install pyangbind==0.8.2
 RUN pip3 uninstall -y enum34
 
 # For sonic-platform-common testing
-RUN pip3 install --break-system-packages redis
-RUN pip3 install --break-system-packages psutil
-RUN pip3 install --break-system-packages blkinfo
+RUN pip3 install redis
+RUN pip3 install psutil
+RUN pip3 install blkinfo
 
 # For sonic-swss-common testing
-RUN pip3 install --break-system-packages Pympler==1.0
+RUN pip3 install Pympler==1.0
 
 # For sonic_yang_model build
-RUN pip3 install --break-system-packages pyang==2.4.0
+RUN pip3 install pyang==2.4.0
 
 # For mgmt-framework build
-RUN pip3 install --break-system-packages mmh3==2.5.1
+RUN pip3 install mmh3==2.5.1
 
 # For ptf-py3 0.10.0
-RUN pip3 install --break-system-packages setuptools==66.1.1 setuptools-scm==8.0.4 setuptools-scm-git-archive==1.4.1
+RUN pip3 install setuptools==66.1.1 setuptools-scm==8.0.4 setuptools-scm-git-archive==1.4.1
 
 RUN eatmydata apt-get install -y xsltproc
 
@@ -629,7 +629,7 @@ RUN eatmydata apt-get install -y vim
 RUN eatmydata apt-get install -y rsyslog
 
 # # For sonic vs image build
-RUN pip3 install --break-system-packages --ignore-installed pexpect
+RUN pip3 install pexpect
 
 {%- if CROSS_BUILD_ENVIRON == "y" %}
 RUN cd /usr/src/gtest && CXX=$CROSS_CXX CC=$CROSS_CC cmake . && make -C /usr/src/gtest
@@ -675,7 +675,7 @@ RUN eatmydata apt-get install  libthrift-0.17 \
         python3-thrift
 
 # Install swi tools
-RUN pip3 install --break-system-packages git+https://github.com/aristanetworks/swi-tools.git@bead66bf261770237f7dd21ace3774ba04a017e9
+RUN pip3 install git+https://github.com/aristanetworks/swi-tools.git@bead66bf261770237f7dd21ace3774ba04a017e9
 
 {% if CONFIGURED_ARCH != "amd64" -%}
 # Install node.js for azure pipeline
