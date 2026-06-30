@@ -539,12 +539,15 @@ Here's a quick-reference of all automation scripts across phases:
 | `audit_dep_completeness.sh` | 1 | Scans all `.dep` files, cross-references against source tree for tracking gaps | Manually reading 50+ dep files and cross-referencing (hours → seconds) |
 | `check_common_files.sh` | 1 | Validates `SONIC_COMMON_BASE_FILES_LIST` and `FLAGS_LIST` completeness | Missing new slave containers or build flags |
 | `run_poc_builds.sh` | 2 | Orchestrates builds A/B/C with environment locking and cleanup | Forgetting cleanup steps, environment drift between builds |
-| `run_negative_controls.sh` | 2 | Runs NC-1 through NC-4 to prove tooling catches real bugs | Trusting results from untested comparison tools |
-| `verify_cache_equivalence.sh` | 3 | Deep-compares two build directories, classifies diffs as cosmetic/semantic | Manual file-by-file comparison across hundreds of artifacts |
+| `run_negative_controls.sh` | 2 | Runs NC-1 through NC-7 (full-build and static-analysis variants) to prove tooling catches real bugs | Trusting results from untested comparison tools |
+| `run_all_baselines.sh` | 2 | Sweep driver: generates per-platform equivalence baselines from a fresh build | Hand-running `--generate-baseline` for each platform |
+| `run_cached_vs_fresh.sh` | 2 | Sweep driver: compares a cached build against its fresh baseline and emits per-platform reports | Manually pairing cached/fresh runs and invoking the verifier |
+| `run_full_sweep.sh` | 2 | Sweep driver: end-to-end orchestration of baseline + cached-vs-fresh across all platforms | Coordinating the whole sweep by hand |
+| `verify_cache_equivalence.sh` | 3 | Deep multi-level comparison (Lvl 1 deb / 2 wheel / 3 docker / 5 installer) with a `--baseline`/`--generate-baseline` workflow; classifies diffs as cosmetic/semantic with false-positive-resistant normalizers | Manual file-by-file comparison across hundreds of artifacts |
 | `classify_diff.sh` | 3 | Parses diffoscope output, applies whitelist patterns | Manually reviewing every timestamp diff as "is this real?" |
 | `dump_cache_keys.sh` | 3 | Shows computed hash1/hash2 and cache status for every target | Guessing why a specific target had cache hit/miss |
-| `generate_findings_report.sh` | 4 | Aggregates all phase outputs into a presentation-ready report | Spending days writing up raw data into a readable format |
-| `ci_cache_regression_check.sh` | 4 | Lightweight CI check that warns when modified files aren't tracked by `.dep` | Future PRs silently breaking cache correctness |
+| `generate_findings_report.sh` | 4 | _(planned — not yet implemented)_ Aggregates all phase outputs into a presentation-ready report | Spending days writing up raw data into a readable format |
+| `ci_cache_regression_check.sh` | 4 | _(planned — not yet implemented)_ Lightweight CI check that warns when modified files aren't tracked by `.dep` | Future PRs silently breaking cache correctness |
 
 **Implementation order**: Scripts build on each other. Phase 1 scripts produce data consumed by Phase 2 scripts (e.g., `audit_dep_completeness.sh` finds untracked files that `run_negative_controls.sh` uses for NC-2). Phase 3 scripts consume Phase 2 build outputs. Phase 4 scripts consume everything.
 
@@ -757,7 +760,7 @@ These tests prove our comparison tooling WORKS — that it would catch real bugs
 
 #### Script: `run_negative_controls.sh`
 
-**What it does**: Automates the 4 negative control tests (NC-1 through NC-4) that validate our comparison tooling actually catches real bugs.
+**What it does**: Automates the negative control tests (NC-1 through NC-7) that validate our comparison tooling actually catches real bugs. Each control runs in a full-build variant and, where applicable, a faster static-analysis variant.
 
 **How it works**:
 1. **NC-1** (tracked file change): 
@@ -779,8 +782,11 @@ These tests prove our comparison tooling WORKS — that it would catch real bugs
    - Adds a comment to a Dockerfile.j2
    - Runs build → expects cache MISS (Dockerfile tracked in dep)
    - Reverts
+5. **NC-5** (submodule pin change): bumps a tracked submodule pin → expects cache MISS (submodule SHA tracked in dep).
+6. **NC-6** (derived-package coverage): verifies every derived package of a built target is present in the cache → expects all-derived-cached.
+7. **NC-7** (per-package `DEP_FLAGS` toggle): toggles a package-specific flag → expects cache MISS.
 
-**Why it's useful**: Proves our tooling isn't just showing "everything passes" because it can't detect differences. If NC-2 passes (detects the semantic diff from stale cache), we know the tooling is trustworthy. If NC-1/NC-3/NC-4 fail (cache miss as expected), we know the hash mechanism works.
+**Why it's useful**: Proves our tooling isn't just showing "everything passes" because it can't detect differences. If NC-2 passes (detects the semantic diff from stale cache), we know the tooling is trustworthy. If the MISS-expecting controls (NC-1/NC-3/NC-4/NC-5/NC-7) behave as expected, we know the hash mechanism works.
 
 **Output format**:
 ```
@@ -788,6 +794,9 @@ NC-1: PASS — Tracked file change triggered cache miss (expected)
 NC-2: PASS — Untracked file change produced stale hit, diffoscope detected semantic diff
 NC-3: PASS — Flag change triggered cache miss (expected)  
 NC-4: PASS — Dockerfile change triggered cache miss (expected)
+NC-5: PASS — Submodule pin change triggered cache miss (expected)
+NC-6: PASS — All derived packages found in cache
+NC-7: PASS — Per-package DEP_FLAGS toggle triggered cache miss (expected)
 ```
 
 ---
@@ -833,6 +842,12 @@ verify_cache_equivalence.sh
 - `0` = all differences are cosmetic (PASS — cache is safe)
 - `1` = semantic differences found (FAIL — cache has bugs)
 - `2` = script error / environment issue
+
+### As implemented (notes vs. the sketch above):
+The shipped `verify_cache_equivalence.sh` refines the original sketch:
+- **Active levels**: Level 1 (`.deb`), Level 2 (`.whl`), Level 3 (Docker image `.gz`), and Level 5 (final `.bin`/`.img.gz` installer). Level 4 (standalone rootfs) is covered transitively via the installer payload at Level 5.
+- **Baseline workflow**: `--generate-baseline <file>` records a fresh build's per-artifact classifications; `--baseline <file>` compares a later (e.g. cached) build against it. This is what the sweep drivers (`run_all_baselines.sh`, `run_cached_vs_fresh.sh`, `run_full_sweep.sh`) orchestrate.
+- **False-positive-resistant normalizers**: beyond the timestamp/header whitelist, the classifier neutralizes known non-semantic churn — `shadow`/`gshadow` last-change field, `debian/changelog` date **and** patch-reorder/author-regroup differences, and ELF code-section-only vs. data-section comparison — while still flagging genuine payload drift (e.g. `.text`/`.rodata` byte changes, missing binaries) as SEMANTIC.
 
 ### Detailed Script Descriptions for Phase 3:
 
@@ -979,6 +994,8 @@ TARGET: swss_1.0.0_amd64.deb
 
 #### Script: `generate_findings_report.sh`
 
+> **Status: planned — not yet implemented.** The consolidation below is currently done by hand from the per-platform reports emitted by the sweep drivers; this script captures the intended automation.
+
 **What it does**: Collects all outputs from Phases 1-3 and generates a consolidated findings report (Markdown + JSON) suitable for presentation or PR submission.
 
 **How it works**:
@@ -1000,6 +1017,8 @@ TARGET: swss_1.0.0_amd64.deb
 ---
 
 #### Script: `ci_cache_regression_check.sh` (for ongoing CI integration)
+
+> **Status: planned — not yet implemented.** Captured here as the intended CI guardrail; the static-coverage logic it describes is currently exercised manually via `audit_dep_completeness.sh`.
 
 **What it does**: A lightweight version of the full PoC that can run in CI to catch cache regressions on every PR.
 
