@@ -13,9 +13,8 @@
 # This script audits the three global cache input mechanisms:
 #   1. SONIC_COMMON_BASE_FILES_LIST — slave container Dockerfiles (build env)
 #   2. SONIC_COMMON_FLAGS_LIST — build flags baked into every cache key
-#   3. SONIC_CACHE_RECIPE_VER — manual version guard for slave.mk changes
-#   4. SONIC_COMMON_FILES_LIST — global input files (.platform, Makefile.cache, etc.)
-#   5. SONIC_COMMON_DPKG_LIST — standard debian packaging files
+#   3. SONIC_COMMON_FILES_LIST — global input files (.platform, slave.mk, Makefile.cache, etc.)
+#   4. SONIC_COMMON_DPKG_LIST — standard debian packaging files
 #
 # It complements audit_dep_completeness.sh (which audits per-package .dep files).
 #
@@ -27,10 +26,9 @@
 #           If a new slave container (e.g., trixie) is added but not registered,
 #           cache keys won't change when the build environment changes.
 #
-# Check 2: Has slave.mk been modified since SONIC_CACHE_RECIPE_VER was last set?
-#           slave.mk orchestrates HOW packages are built. If it changes (e.g., new
-#           compiler flags, different pip install steps), cached packages built with
-#           the old recipe may differ from fresh builds.
+# Check 2: Is slave.mk tracked in SONIC_COMMON_FILES_LIST?
+#           slave.mk defines HOW packages are built. It must be tracked globally
+#           so that any change invalidates all cached packages.
 #
 # Check 3: Are all globally-impactful build flags tracked?
 #           Scans rules/*.mk for flags used in 4+ package files (e.g., INCLUDE_FIPS,
@@ -253,71 +251,23 @@ if $FIX_MODE && [[ $FINDINGS_P1 -gt 0 || $FINDINGS_P0 -gt 0 ]]; then
 fi
 
 # ============================================================
-# CHECK 2: SONIC_CACHE_RECIPE_VER vs slave.mk changes
+# CHECK 2: Verify slave.mk is in SONIC_COMMON_FILES_LIST
 # ============================================================
-echo -e "\n${CYAN}━━━ Check 2: SONIC_CACHE_RECIPE_VER Guard ━━━${NC}"
-echo "  Purpose: Detect if slave.mk changed without a recipe version bump."
-echo "  Why: slave.mk is intentionally excluded from cache keys (to avoid"
-echo "       invalidating all caches on every slave.mk touch). Instead,"
-echo "       SONIC_CACHE_RECIPE_VER must be manually bumped when slave.mk"
-echo "       changes affect package build output."
+echo -e "\n${CYAN}━━━ Check 2: slave.mk Global Tracking ━━━${NC}"
+echo "  Purpose: Confirm slave.mk is tracked in SONIC_COMMON_FILES_LIST."
+echo "  Why: slave.mk defines build recipes for all packages. Changes to it"
+echo "       must invalidate all caches to prevent stale artifacts."
 echo ""
 
-# Get current baseline hash from Makefile.cache
-BASELINE_HASH=$(grep "SONIC_CACHE_RECIPE_VER_BASELINE" "$MAKEFILE_CACHE" | \
-    grep -oP '[a-f0-9]{40}' | head -1)
-RECIPE_VER=$(grep "^SONIC_CACHE_RECIPE_VER\s*:=" "$MAKEFILE_CACHE" | \
-    grep -oP '\d+' | head -1)
-
-echo "  Current SONIC_CACHE_RECIPE_VER: $RECIPE_VER"
-echo "  Baseline slave.mk hash: ${BASELINE_HASH:-NOT SET}"
-
-# Compute current slave.mk hash
-if [[ -f "$SLAVE_MK" ]]; then
-    CURRENT_HASH=$(git -C "$REPO_ROOT" hash-object "$SLAVE_MK" 2>/dev/null || echo "UNKNOWN")
-    echo "  Current slave.mk hash:  $CURRENT_HASH"
-
-    if [[ "$CURRENT_HASH" == "$BASELINE_HASH" ]]; then
-        echo -e "  ${GREEN}✓ slave.mk unchanged since last recipe version review${NC}"
-    else
-        echo -e "  ${YELLOW}⚠ slave.mk has changed since SONIC_CACHE_RECIPE_VER was last set!${NC}"
-        add_finding "P1" "SONIC_CACHE_RECIPE_VER" \
-            "slave.mk changed since recipe ver baseline (hash mismatch)" \
-            "Review changes; bump SONIC_CACHE_RECIPE_VER if build-affecting"
-        echo ""
-
-        # Show what changed
-        if $VERBOSE; then
-            echo "  Changes to slave.mk since baseline:"
-            # Find the commit that introduced the baseline
-            BASELINE_COMMIT=$(git -C "$REPO_ROOT" --no-pager log --all --format="%H" \
-                -- Makefile.cache | head -1)
-            if [[ -n "$BASELINE_COMMIT" ]]; then
-                echo "  (commits since last Makefile.cache update):"
-                git -C "$REPO_ROOT" --no-pager log --oneline "$BASELINE_COMMIT"..HEAD \
-                    -- slave.mk 2>/dev/null | sed 's/^/    /' | head -20
-            fi
-        fi
-
-        echo ""
-        echo "  Action required:"
-        echo "    1. Review slave.mk changes — do they affect package build output?"
-        echo "    2. If YES: bump SONIC_CACHE_RECIPE_VER to $((RECIPE_VER + 1))"
-        echo "    3. Update SONIC_CACHE_RECIPE_VER_BASELINE to: $CURRENT_HASH"
-
-        if $FIX_MODE; then
-            echo ""
-            echo -e "  ${CYAN}Suggested Makefile.cache edit (if change is non-functional):${NC}"
-            echo "    SONIC_CACHE_RECIPE_VER_BASELINE := $CURRENT_HASH"
-            echo ""
-            echo -e "  ${CYAN}Suggested Makefile.cache edit (if change affects output):${NC}"
-            echo "    SONIC_CACHE_RECIPE_VER := $((RECIPE_VER + 1))"
-            echo "    SONIC_CACHE_RECIPE_VER_BASELINE := $CURRENT_HASH"
-        fi
-    fi
+COMMON_FILES_LINE=$(grep "^SONIC_COMMON_FILES_LIST" "$MAKEFILE_CACHE" | head -1)
+if echo "$COMMON_FILES_LINE" | grep -qF "slave.mk"; then
+    echo -e "  ${GREEN}✓ slave.mk is tracked in SONIC_COMMON_FILES_LIST${NC}"
+    echo "  Any change to slave.mk will invalidate all cached packages."
 else
-    echo -e "  ${RED}ERROR: slave.mk not found${NC}"
-    add_finding "P0" "slave.mk" "File not found" "Ensure script runs from sonic-buildimage root"
+    echo -e "  ${RED}✗ slave.mk is NOT tracked in SONIC_COMMON_FILES_LIST${NC}"
+    add_finding "P0" "SONIC_COMMON_FILES_LIST" \
+        "slave.mk is missing from SONIC_COMMON_FILES_LIST" \
+        "Add slave.mk to SONIC_COMMON_FILES_LIST to prevent stale cache hits"
 fi
 
 # ============================================================

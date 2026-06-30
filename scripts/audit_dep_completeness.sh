@@ -142,6 +142,7 @@ set -uo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 RULES_DIR="$REPO_ROOT/rules"
+PLATFORM_DIR="$REPO_ROOT/platform/${CONFIGURED_PLATFORM:-vs}"
 MAKEFILE_CACHE="$REPO_ROOT/Makefile.cache"
 
 # Colors for terminal output
@@ -243,7 +244,32 @@ check_missing_dep_files() {
 
         if [[ ! -f "$dep_file" ]]; then
             ((count++))
-            add_finding "P1" "$base" "No .dep file — package is never cached" "Create $dep_file to enable caching"
+            # Check if any cached package depends on this uncached package.
+            # If yes → P1 (downstream stale risk). If no → P2 (performance only).
+            # Strategy: extract variable names assigned in this .mk file, then check
+            # if other .mk files reference them in DEPENDS lines.
+            local has_dependents=false
+            local defined_vars
+            # Match both "$(VAR)_DEPENDS" style and "VAR = value" style assignments
+            defined_vars=$(grep -oP '^\s*\$\(\K[A-Z][A-Z0-9_]+' "$mk_file" 2>/dev/null | sort -u)
+            if [[ -z "$defined_vars" ]]; then
+                # Try bare variable assignments (VAR = value)
+                defined_vars=$(grep -oP '^\s*\K[A-Z][A-Z0-9_]+(?=\s*[:+?]?=)' "$mk_file" 2>/dev/null | sort -u)
+            fi
+            for var in $defined_vars; do
+                # Skip common non-package variables
+                [[ "$var" =~ ^(SONIC_|BLDENV|CONFIGURED|PATH|SRC_PATH|VERSION) ]] && continue
+                if grep -rl "DEPENDS.*\$($var)" "$RULES_DIR"/*.mk "$PLATFORM_DIR"/*.mk 2>/dev/null | grep -qv "$mk_file"; then
+                    has_dependents=true
+                    break
+                fi
+            done
+
+            if $has_dependents; then
+                add_finding "P1" "$base" "No .dep file — package is never cached (other cached packages depend on it)" "Create $dep_file to enable caching"
+            else
+                add_finding "P2" "$base" "No .dep file — package is never cached (performance only, no downstream dependents)" "Create $dep_file to enable caching"
+            fi
             if $VERBOSE; then
                 echo -e "  ${YELLOW}MISSING${NC}: $base.dep (targets defined in $base.mk)"
             fi
@@ -286,6 +312,11 @@ check_common_base_files() {
 # For each .dep, check if the .mk uses conditional flags not declared in DEP_FLAGS
 check_dep_flags_coverage() {
     echo -e "\n${CYAN}=== Check 3: DEP_FLAGS coverage vs conditional build flags ===${NC}"
+
+    # Extract SONIC_COMMON_FLAGS_LIST once for lookups
+    local common_flags_list
+    common_flags_list=$(sed -n '/^SONIC_COMMON_FLAGS_LIST/,/[^\\]$/p' "$MAKEFILE_CACHE" | \
+        grep -oP '\$\(\w+\)' | tr -d '$()' | sort -u)
 
     for dep_file in "$RULES_DIR"/*.dep; do
         local base
@@ -369,13 +400,20 @@ check_dep_flags_coverage() {
 
             # Check if flag is in DEP_FLAGS (directly or via SONIC_COMMON_FLAGS_LIST)
             if ! echo "$dep_flags" | grep -q "$flag"; then
-                # Check if it's already in SONIC_COMMON_FLAGS_LIST
-                if grep -q "$flag" "$MAKEFILE_CACHE" 2>/dev/null && \
-                   grep "SONIC_COMMON_FLAGS_LIST" "$MAKEFILE_CACHE" | grep -q "$flag"; then
+                # Check if it's already in SONIC_COMMON_FLAGS_LIST (also check SONIC_ prefix variant)
+                local flag_in_common=false
+                if echo "$common_flags_list" | grep -q "^${flag}$"; then
+                    flag_in_common=true
+                elif echo "$common_flags_list" | grep -q "^SONIC_${flag}$"; then
+                    flag_in_common=true
+                fi
+
+                if $flag_in_common; then
                     log_verbose "$base: $flag is in SONIC_COMMON_FLAGS_LIST (OK)"
                 elif echo "$dep_flags" | grep -q "SONIC_COMMON_FLAGS_LIST"; then
                     # The dep uses SONIC_COMMON_FLAGS_LIST — check if the flag is there
-                    if grep "SONIC_COMMON_FLAGS_LIST" "$MAKEFILE_CACHE" | grep -q "$flag"; then
+                    if echo "$common_flags_list" | grep -q "^${flag}$" || \
+                       echo "$common_flags_list" | grep -q "^SONIC_${flag}$"; then
                         log_verbose "$base: $flag covered via SONIC_COMMON_FLAGS_LIST"
                     else
                         add_finding "P1" "$base" \
@@ -557,9 +595,10 @@ check_common_flags_completeness() {
     echo -e "\n${CYAN}=== Check 8: SONIC_COMMON_FLAGS_LIST vs actual build-affecting variables ===${NC}"
 
     # Extract flags from SONIC_COMMON_FLAGS_LIST in Makefile.cache
+    # Only extract from the actual definition line (lines 112-118), not subsequent content
     local common_flags
-    common_flags=$(grep -A 10 "SONIC_COMMON_FLAGS_LIST" "$MAKEFILE_CACHE" | \
-        grep -oP '\$\(\w+\)' | tr -d '$()')
+    common_flags=$(sed -n '/^SONIC_COMMON_FLAGS_LIST/,/[^\\]$/p' "$MAKEFILE_CACHE" | \
+        grep -oP '\$\(\w+\)' | tr -d '$()' | sort -u)
 
     echo "  Current SONIC_COMMON_FLAGS_LIST:"
     echo "$common_flags" | sed 's/^/    /'
@@ -610,7 +649,8 @@ check_common_flags_completeness() {
     local gap_count=0
     while IFS= read -r flag; do
         [[ -z "$flag" ]] && continue
-        if ! echo "$common_flags" | grep -q "^${flag}$"; then
+        if ! echo "$common_flags" | grep -q "^${flag}$" && \
+           ! echo "$common_flags" | grep -q "^SONIC_${flag}$"; then
             # Check if it's a known assembly-only flag (false positive)
             local is_assembly_only=false
             for known in "${KNOWN_ASSEMBLY_ONLY_FLAGS[@]}"; do
@@ -641,7 +681,7 @@ check_common_flags_completeness() {
             echo -e "    ${YELLOW}$flag${NC}"
             add_finding "P2" "Makefile.cache" \
                 "slave.mk uses \$$flag in conditional but it's not in SONIC_COMMON_FLAGS_LIST" \
-                "If this flag affects package build output, add to SONIC_COMMON_FLAGS_LIST or bump SONIC_CACHE_RECIPE_VER when changed"
+                "If this flag affects package build output, add to SONIC_COMMON_FLAGS_LIST"
         fi
     done <<< "$slave_flags"
 
