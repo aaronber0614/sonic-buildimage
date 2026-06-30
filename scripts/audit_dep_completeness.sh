@@ -122,12 +122,20 @@
 #   is INSTALLED into the final NOS image (SONIC_INSTALL_DOCKER_IMAGES) — they
 #   don't change what's INSIDE the image during build.
 #
-# - Block-content analysis: For Check 3, the script inspects WHAT a conditional
-#   block does. If it only modifies SONIC_INSTALL_DOCKER_IMAGES, SONIC_PACKAGES_LOCAL,
-#   or DEFAULT_FEATURE_STATE/OWNER, it's classified as assembly-only (not a gap).
+# - Block-content analysis (data-driven, no hand-maintained flag lists): the script
+#   inspects WHAT a conditional block DOES rather than matching flag names. A block is
+#   "build-affecting" only if it touches a stable SONiC build variable (see
+#   BUILD_SIGNAL_RE: *_DEPENDS/_RDEPENDS/_DBG_PACKAGES/_EXTRA_DEBS/_DERIVED_DEBS/
+#   _SRC_PATH/_BUILD_ENV/_MAKE_ENV/_CFLAGS/_MAKE_TARGET, dpkg-buildpackage,
+#   DEB_BUILD_OPTIONS). Blocks that only select/assemble packages (SONIC_MAKE_DEBS,
+#   SONIC_INSTALL_DOCKER_IMAGES, SONIC_PACKAGES_LOCAL, DEFAULT_FEATURE_STATE/OWNER)
+#   carry no build signal and are classified assembly-only (not a gap). These naming
+#   conventions are fixed by Makefile.cache/slave.mk, so the audit needs no upkeep as
+#   new feature flags are added.
 #
-# - Deprecated flags: ENABLE_PY2_MODULES is always 'n' on modern distros and is
-#   reported as P3 informational only.
+# - Deprecated flags: detected generically — any flag pinned to 'n' for the modern
+#   build envs (an if(n)eq filter on $(BLDENV) naming bookworm/trixie that sets the
+#   flag = n in slave.mk) is reported as P3 informational only.
 #
 # ═══════════════════════════════════════════════════════════════════════════════
 # CONTEXT
@@ -240,6 +248,87 @@ json_escape() {
     s="${s//	/\\t}"    # literal tab -> \t
     printf '%s' "$s"
 }
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Data-driven flag classifiers (no hand-maintained allow-lists)
+# ─────────────────────────────────────────────────────────────────────────────
+# Whether a build flag affects cached package output is decided by INSPECTING
+# what its ifeq/ifneq blocks actually DO, using the SONiC Make build-variable
+# naming convention as the signal. That convention (e.g. *_DEPENDS, *_DBG_PACKAGES)
+# is fixed by Makefile.cache/slave.mk and effectively never changes, whereas the
+# set of feature flags grows constantly — so this needs no manual upkeep.
+
+# A conditional block is "build-affecting" if it assigns to a package build
+# input: dependency lists, derived/extra/dbg debs, source paths, build env/flags,
+# or runs a build recipe. Blocks that only touch image-assembly / installer /
+# feature-inclusion variables (e.g. SONIC_INSTALL_DOCKER_IMAGES, *_DOCKERS,
+# SONIC_PACKAGES*, DEFAULT_FEATURE_*) do NOT match and are treated as cosmetic.
+readonly BUILD_SIGNAL_RE='_(DEPENDS|RDEPENDS|DBG_DEPENDS|DBG_PACKAGES|EXTRA_DEBS|DERIVED_DEBS|SRC_PATH|BUILD_ENV|MAKE_ENV|CFLAGS|MAKE_TARGET)[[:space:]+:=]|dpkg-buildpackage|DEB_BUILD_OPTIONS'
+
+# Print the ifeq/ifneq($(flag)...) ... endif block(s) that reference $flag in $file.
+# Captures ALL such blocks (not just the first) and tolerates nested conditionals
+# via depth tracking, so build signals in later blocks are not missed.
+flag_blocks_in_file() {
+    local flag="$1" file="$2"
+    [[ -f "$file" ]] || return 0
+    awk -v flag="$flag" '
+        function isif(l){ return (l ~ /^[[:space:]]*if(eq|neq|def|ndef)([[:space:]]|\()/) }
+        depth==0 && $0 ~ ("if(eq|neq).*\\$\\(" flag "\\)") { depth=1; print; next }
+        depth>0 {
+            print
+            if (isif($0)) depth++
+            else if ($0 ~ /^[[:space:]]*endif([[:space:]]|$)/) depth--
+        }
+    ' "$file" 2>/dev/null || true
+}
+
+# True (0) if any block content carries a build signal (i.e. affects build output).
+block_is_build_affecting() {
+    echo "$1" | grep -qE "$BUILD_SIGNAL_RE"
+}
+
+# True (0) if $flag gates a package BUILD input anywhere in rules/*.mk or slave.mk.
+flag_affects_build() {
+    local flag="$1" f
+    for f in "$RULES_DIR"/*.mk "$REPO_ROOT/slave.mk"; do
+        if block_is_build_affecting "$(flag_blocks_in_file "$flag" "$f")"; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+# True (0) if $flag is tracked in some cache key: SONIC_COMMON_FLAGS_LIST (with or
+# without SONIC_ prefix) or any per-package *_DEP_FLAGS in rules/*.dep.
+flag_tracked_anywhere() {
+    local flag="$1"
+    if echo "$COMMON_FLAGS_LIST_CACHE" | grep -qx "$flag" || \
+       echo "$COMMON_FLAGS_LIST_CACHE" | grep -qx "SONIC_${flag}"; then
+        return 0
+    fi
+    grep -lE "_DEP_FLAGS" "$RULES_DIR"/*.dep 2>/dev/null \
+        | xargs -r grep -lE "\\\$\\(${flag}\\)" 2>/dev/null | grep -q . && return 0
+    return 1
+}
+
+# True (0) if slave.mk pins $flag to 'n' for all modern build envs
+# (bookworm/trixie), making it effectively deprecated/dead (e.g. ENABLE_PY2_MODULES).
+flag_forced_off_for_modern_bldenv() {
+    local flag="$1"
+    awk -v flag="$flag" '
+        /if(eq|neq).*filter.*\$\(BLDENV\)/ { inblk = (/bookworm/ && /trixie/) ? 1 : 0; next }
+        inblk && $0 ~ ("^[[:space:]]*" flag "[[:space:]]*=[[:space:]]*n([[:space:]]|$)") { found=1 }
+        /^endif/ { inblk=0 }
+        END { exit(found?0:1) }
+    ' "$REPO_ROOT/slave.mk" 2>/dev/null
+}
+
+# SONIC_COMMON_FLAGS_LIST contents, computed once (used by classifiers above).
+compute_common_flags_list() {
+    COMMON_FLAGS_LIST_CACHE=$(sed -n '/^SONIC_COMMON_FLAGS_LIST/,/[^\\]$/p' "$MAKEFILE_CACHE" \
+        | grep -oP '\$\(\w+\)' | tr -d '$()' | sort -u)
+}
+COMMON_FLAGS_LIST_CACHE=""
 
 # --- Check 1: Missing .dep files ---
 # Packages with .mk files but no .dep file are NEVER cached.
@@ -377,47 +466,27 @@ check_dep_flags_coverage() {
         while IFS= read -r flag; do
             [[ -z "$flag" ]] && continue
 
-            # --- FALSE POSITIVE FILTERING ---
+            # --- FALSE POSITIVE FILTERING (data-driven, no flag allow-lists) ---
 
-            # Pattern 0: Effectively deprecated flags (always off in current build envs)
-            # ENABLE_PY2_MODULES is always 'n' on bullseye/bookworm/trixie
-            if [[ "$flag" == "ENABLE_PY2_MODULES" ]]; then
-                log_verbose "$base: \$$flag is deprecated (always n on current build envs) — downgrading to P3"
+            # Pattern 0: Effectively deprecated flags — pinned off for all modern
+            # build envs (bookworm/trixie) in slave.mk, so their conditional is
+            # dead code. Detected from slave.mk rather than a hardcoded name list.
+            if flag_forced_off_for_modern_bldenv "$flag"; then
+                log_verbose "$base: \$$flag is pinned off for modern BLDENV — downgrading to P3"
                 add_finding "P3" "$base" \
-                    "Flag \$$flag used but effectively deprecated (always n on bullseye/bookworm/trixie)" \
-                    "Low priority — only matters for legacy jessie/stretch/buster builds"
+                    "Flag \$$flag used but effectively deprecated (pinned to 'n' for bookworm/trixie in slave.mk)" \
+                    "Low priority — only matters for legacy build envs where the flag can be 'y'"
                 continue
             fi
 
-            # Check what the conditional actually DOES in the .mk file.
-            # Extract lines inside the ifeq block for this flag
+            # Pattern 1: Flag's conditional in this .mk only controls image
+            # assembly / installer inclusion (e.g. SONIC_INSTALL_DOCKER_IMAGES,
+            # SONIC_PACKAGES_LOCAL) and does NOT touch any package build input.
+            # Classified by build-signal inspection, not a hardcoded variable list.
             local block_content
-            block_content=$(sed -n "/ifeq.*\$(${flag})/,/endif/p" "$mk_file" 2>/dev/null || true)
-
-            # Pattern 1: Flag only controls SONIC_INSTALL_DOCKER_IMAGES / SONIC_INSTALL_DOCKER_DBG_IMAGES
-            # These don't affect how the package/image is BUILT, only whether it's included in the final OS
-            local install_only=false
-            if [[ -n "$block_content" ]]; then
-                # Get non-comment, non-empty lines inside the block (excluding ifeq/endif)
-                local action_lines
-                action_lines=$(echo "$block_content" | grep -v "^#\|^ifeq\|^ifneq\|^endif\|^else\|^$" | \
-                    sed 's/^[[:space:]]*//' || true)
-
-                if [[ -n "$action_lines" ]]; then
-                    # Check if ALL action lines only affect install/inclusion/metadata (not build)
-                    local non_install_lines
-                    non_install_lines=$(echo "$action_lines" | \
-                        grep -v "SONIC_INSTALL_DOCKER_IMAGES\|SONIC_INSTALL_DOCKER_DBG_IMAGES\|SONIC_BOOKWORM_DOCKERS\|SONIC_TRIXIE_DOCKERS\|SONIC_BULLSEYE_DOCKERS\|SONIC_BUSTER_DOCKERS\|SONIC_BOOKWORM_DBG_DOCKERS\|SONIC_TRIXIE_DBG_DOCKERS\|SONIC_BULLSEYE_DBG_DOCKERS\|DEFAULT_FEATURE_OWNER\|DEFAULT_FEATURE_STATE\|SONIC_DOCKER_IMAGES\|SONIC_DOCKER_DBG_IMAGES\|SONIC_PACKAGES_LOCAL\|SONIC_PACKAGES " || true)
-
-                    if [[ -z "$non_install_lines" ]]; then
-                        install_only=true
-                        log_verbose "$base: \$$flag only controls INSTALL/metadata (not build) — skipping"
-                    fi
-                fi
-            fi
-
-            # Skip false positives
-            if $install_only; then
+            block_content=$(flag_blocks_in_file "$flag" "$mk_file")
+            if [[ -n "$block_content" ]] && ! block_is_build_affecting "$block_content"; then
+                log_verbose "$base: \$$flag only controls assembly/inclusion (no build signal) — skipping"
                 continue
             fi
 
@@ -617,95 +686,43 @@ check_docker_dep_tracking() {
 check_common_flags_completeness() {
     echo -e "\n${CYAN}=== Check 8: SONIC_COMMON_FLAGS_LIST vs actual build-affecting variables ===${NC}"
 
-    # Extract flags from SONIC_COMMON_FLAGS_LIST in Makefile.cache
-    # Only extract from the actual definition line (lines 112-118), not subsequent content
-    local common_flags
-    common_flags=$(sed -n '/^SONIC_COMMON_FLAGS_LIST/,/[^\\]$/p' "$MAKEFILE_CACHE" | \
-        grep -oP '\$\(\w+\)' | tr -d '$()' | sort -u)
+    local common_flags="$COMMON_FLAGS_LIST_CACHE"
 
     echo "  Current SONIC_COMMON_FLAGS_LIST:"
     echo "$common_flags" | sed 's/^/    /'
 
-    # Look for ENABLE_*/INCLUDE_*/SONIC_* vars used in slave.mk conditionals
+    # Look for ENABLE_*/INCLUDE_*/INSTALL_*/SONIC_* vars used in slave.mk conditionals
     local slave_flags
-    slave_flags=$(grep -oP '(?<=ifeq \(\$\()(ENABLE_\w+|INCLUDE_\w+|SONIC_\w+)(?=\))' \
+    slave_flags=$(grep -oP '(?<=ifeq \(\$\()(ENABLE_\w+|INCLUDE_\w+|INSTALL_\w+|SONIC_\w+)(?=\))' \
         "$REPO_ROOT/slave.mk" 2>/dev/null | sort -u)
 
-    # Flags that are known to NOT affect cached package output:
-    # - They only affect post-build assembly (rootfs, installer, Docker inclusion)
-    # - They only affect parallelism or tooling options
-    # - They're already tracked per-package in individual .dep files
-    local KNOWN_ASSEMBLY_ONLY_FLAGS=(
-        "SONIC_BUILD_JOBS"
-        "SONIC_CONFIG_MAKE_JOBS"
-        "SONIC_CONFIG_USE_CCACHE"
-        "SONIC_INSTALL_DEBUG_TOOLS"  # slave.mk-level: only drives debug-IMAGE assembly. Its per-package content impact (docker-base _DBG_PACKAGES) is caught by Check 3 as INSTALL_DEBUG_TOOLS.
-        "SONIC_INCLUDE_MUX"
-        "SONIC_INCLUDE_NAT"
-        "SONIC_INCLUDE_SFLOW"
-        "SONIC_INCLUDE_STP"
-        "SONIC_INCLUDE_MACSEC"
-        "SONIC_INCLUDE_RESTAPI"
-        "SONIC_INCLUDE_P4RT"
-        "SONIC_INCLUDE_SYSTEM_BMP"
-        "SONIC_INCLUDE_SYSTEM_EVENTD"
-        "SONIC_INCLUDE_SYSTEM_GNMI"
-        "SONIC_INCLUDE_SYSTEM_OTEL"
-        "SONIC_INCLUDE_SYSTEM_TELEMETRY"
-        "SONIC_ENABLE_BOOTCHART"
-        "SONIC_INCLUDE_BOOTCHART"
-        "SONIC_ENABLE_PFCWD_ON_START"
-        "SONIC_IMAGE_VERSION"
-        "SONIC_USE_PDDF_FRAMEWORK"
-        "SONIC_SAITHRIFT_V2"
-        "INCLUDE_P4RT"
-    )
-    # Flags tracked per-package (not needed globally)
-    local KNOWN_PER_PACKAGE_FLAGS=(
-        "ENABLE_ASAN"
-        "ENABLE_AUTO_TECH_SUPPORT"
-    )
-
     echo ""
-    echo "  Flags used in slave.mk conditionals but NOT in SONIC_COMMON_FLAGS_LIST:"
+    echo "  Flags used in slave.mk conditionals but NOT tracked in any cache key:"
 
+    # A slave.mk flag is only a real gap if it (a) actually affects package build
+    # output AND (b) is not tracked anywhere (global list or per-package DEP_FLAGS).
+    # Both tests are data-driven, so no assembly-only / per-package allow-lists are
+    # maintained: flags that merely drive image assembly are filtered by
+    # flag_affects_build, and flags tracked per-package are filtered by
+    # flag_tracked_anywhere.
     local gap_count=0
     while IFS= read -r flag; do
         [[ -z "$flag" ]] && continue
-        if ! echo "$common_flags" | grep -q "^${flag}$" && \
-           ! echo "$common_flags" | grep -q "^SONIC_${flag}$"; then
-            # Check if it's a known assembly-only flag (false positive)
-            local is_assembly_only=false
-            for known in "${KNOWN_ASSEMBLY_ONLY_FLAGS[@]}"; do
-                if [[ "$flag" == "$known" ]]; then
-                    is_assembly_only=true
-                    break
-                fi
-            done
-            if $is_assembly_only; then
-                log_verbose "  $flag — assembly/inclusion only (skipped)"
-                continue
-            fi
 
-            # Check if it's tracked per-package
-            local is_per_package=false
-            for known in "${KNOWN_PER_PACKAGE_FLAGS[@]}"; do
-                if [[ "$flag" == "$known" ]]; then
-                    is_per_package=true
-                    break
-                fi
-            done
-            if $is_per_package; then
-                log_verbose "  $flag — tracked per-package in .dep files (skipped)"
-                continue
-            fi
-
-            ((gap_count++))
-            echo -e "    ${YELLOW}$flag${NC}"
-            add_finding "P2" "Makefile.cache" \
-                "slave.mk uses \$$flag in conditional but it's not in SONIC_COMMON_FLAGS_LIST" \
-                "If this flag affects package build output, add to SONIC_COMMON_FLAGS_LIST"
+        if ! flag_affects_build "$flag"; then
+            log_verbose "  $flag — no build signal (assembly/inclusion/orchestration only)"
+            continue
         fi
+        if flag_tracked_anywhere "$flag"; then
+            log_verbose "  $flag — tracked globally or per-package (OK)"
+            continue
+        fi
+
+        ((gap_count++))
+        echo -e "    ${YELLOW}$flag${NC}"
+        add_finding "P2" "Makefile.cache" \
+            "slave.mk uses \$$flag in a build-affecting conditional but it's tracked in neither SONIC_COMMON_FLAGS_LIST nor any package DEP_FLAGS" \
+            "Add \$($flag) to SONIC_COMMON_FLAGS_LIST, or to the DEP_FLAGS of each affected package"
     done <<< "$slave_flags"
 
     if [[ $gap_count -eq 0 ]]; then
@@ -849,6 +866,9 @@ main() {
     if [[ -n "$FILTER_PACKAGE" ]]; then
         echo -e "  ${CYAN}Filtering to package: $FILTER_PACKAGE${NC}"
     fi
+
+    # Precompute the global flag list once for the data-driven classifiers.
+    compute_common_flags_list
 
     # Run all checks
     check_missing_dep_files
