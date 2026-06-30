@@ -243,7 +243,7 @@ capture_env_snapshot() {
     "timestamp": "$snapshot_time",
     "git_head": "$(git -C "$REPO_ROOT" rev-parse HEAD)",
     "git_branch": "$(git -C "$REPO_ROOT" branch --show-current)",
-    "git_dirty": $(git -C "$REPO_ROOT" diff --quiet 2>/dev/null && echo "false" || echo "true"),
+    "git_dirty": $(git -C "$REPO_ROOT" diff --quiet --ignore-submodules=dirty 2>/dev/null && echo "false" || echo "true"),
     "platform": "$PLATFORM",
     "bldenv": "$BLDENV",
     "configured_arch": "$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/')",
@@ -276,7 +276,7 @@ verify_env_unchanged() {
         return 1
     fi
 
-    if ! git -C "$REPO_ROOT" diff --quiet 2>/dev/null; then
+    if ! git -C "$REPO_ROOT" diff --quiet --ignore-submodules 2>/dev/null; then
         log_error "Working tree has uncommitted changes since snapshot!"
         return 1
     fi
@@ -313,6 +313,9 @@ clean_build_artifacts() {
         log_info "  Removing target/python-debs/"
         $DRY_RUN || rm -rf "$REPO_ROOT/target/python-debs"
     fi
+
+    # Recreate directory structure (make requires these to exist)
+    $DRY_RUN || mkdir -p "$debs_dir/${BLDENV}" "$wheels_dir/${BLDENV}" "$REPO_ROOT/target/python-debs/${BLDENV}"
 
     # Remove tracking/hash files that trigger cache lookup
     log_info "  Removing .flags/.dep.sha/.smod.smsha tracking files"
@@ -417,9 +420,18 @@ run_build() {
     # Determine build target
     local target="${BUILD_TARGET:-}"
     if [[ -z "$target" ]]; then
-        # Default: build all .deb packages for the configured environment
-        target="target/debs/${BLDENV}/"
-        log_info "Building all packages (target/debs/${BLDENV}/)"
+        # Build only bookworm (the primary BLDENV). Using NOTRIXIE=1 avoids
+        # building trixie as well. The target 'all' goes through the top-level
+        # Makefile dispatcher into Makefile.work -> slave.mk.
+        target="all"
+        # Disable all BLDENVs except the target one
+        make_args+=("NOJESSIE=1" "NOSTRETCH=1" "NOBUSTER=1" "NOBULLSEYE=1")
+        if [[ "$BLDENV" == "bookworm" ]]; then
+            make_args+=("NOBOOKWORM=0" "NOTRIXIE=1")
+        elif [[ "$BLDENV" == "trixie" ]]; then
+            make_args+=("NOBOOKWORM=1" "NOTRIXIE=0")
+        fi
+        log_info "Building all targets for ${BLDENV} only"
     else
         log_info "Building target: $target"
     fi
@@ -506,11 +518,11 @@ preflight_checks() {
 
     # Check 1: Clean git tree
     log_info "Checking git working tree..."
-    if ! git -C "$REPO_ROOT" diff --quiet 2>/dev/null; then
+    if ! git -C "$REPO_ROOT" diff --quiet --ignore-submodules 2>/dev/null; then
         log_error "Working tree has uncommitted changes!"
         log_error "Commit or stash changes before running PoC builds."
         echo ""
-        git -C "$REPO_ROOT" status --short | head -10
+        git -C "$REPO_ROOT" status --short --ignore-submodules | head -10
         exit 2
     fi
     log_success "Git working tree is clean"
@@ -585,9 +597,28 @@ main() {
         run_build "A" "none" || exit 1
     fi
 
-    # Build B: Cache write
+    # Cleanup between A and B — Build B must rebuild from source to populate cache
     if $run_b; then
+        echo ""
+        echo -e "${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+        echo -e "${BOLD}  CLEANUP — Preparing for Cache-Write Build${NC}"
+        echo -e "${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+        echo ""
+        if ! $DRY_RUN; then
+            clean_build_artifacts
+        else
+            log_warn "[DRY RUN] Would clean build artifacts"
+        fi
         run_build "B" "wcache" || exit 1
+
+        # Verify cache was actually populated
+        local cache_count
+        cache_count=$(find "$CACHE_DIR" -name "*.tgz" 2>/dev/null | wc -l)
+        log_info "Cache directory contains $cache_count .tgz files after Build B"
+        if [[ "$cache_count" -eq 0 ]]; then
+            log_error "No cache files written during Build B! Cache validation cannot proceed."
+            exit 1
+        fi
     fi
 
     # Cleanup between B and C

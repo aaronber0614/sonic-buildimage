@@ -56,11 +56,11 @@
 #
 # Cache filename format: <target>-<DEP_MOD_SHA>-<MOD_HASH>.tgz
 #
-# MOD_HASH (24 chars):
+# MOD_HASH (23 chars):
 #   - GIT_CONTENT_SHA mode (default): sha1sum of (.flags + .dep.sha + .smod.smsha)
 #   - GIT_COMMIT_SHA mode: last git commit hash in the source directory
 #
-# DEP_MOD_SHA (24 chars):
+# DEP_MOD_SHA (23 chars):
 #   For each dependency in _DEPENDS:
 #     - Include that dep's .flags, .dep.sha, .smod.smsha
 #     - Include that dep's OWN DEP_MOD_SHA and MOD_HASH (transitive!)
