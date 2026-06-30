@@ -48,7 +48,7 @@
 #   --dir-b DIR    Second build directory (e.g., poc-results/build-C)
 #
 # Optional:
-#   --level LEVELS       Comma-separated levels to compare: 1,2,3,5 (default: 1,2,3)
+#   --level LEVELS       Comma-separated levels to compare: 1,2,3,5 (default: 1,2,3,5)
 #   --output-dir DIR     Report output directory (default: ./poc-results/comparison/)
 #   --diffoscope         Force diffoscope even for non-semantic diffs (auto-runs on semantic by default)
 #   --no-diffoscope      Disable automatic diffoscope on semantic diffs

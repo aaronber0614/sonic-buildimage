@@ -52,6 +52,13 @@
 #   - Proves: add_derived_package mechanism works correctly
 #   - Addresses bug found during PoC (libnl3 derived package not cached)
 #
+# NC-7: Per-package DEP_FLAGS toggle → expects CACHE MISS
+#   - Static analysis: verifies a flag listed in a package's DEP_FLAGS is in its
+#     .flags file and that toggling its value would change the cache key
+#   - Canonical example: INCLUDE_FIPS on docker-base-bookworm
+#   - Proves: adding a flag to DEP_FLAGS prevents stale cache serving (the fix
+#     pattern for P1 findings)
+#
 # ═══════════════════════════════════════════════════════════════════════════════
 # USAGE
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -62,7 +69,7 @@
 #   --cache-dir DIR    Cache directory (must contain artifacts from a prior wcache build)
 #
 # Optional:
-#   --test NC          Run only a specific test: NC-1, NC-2, NC-3, or NC-4
+#   --test NC          Run only a specific test: NC-1 through NC-7
 #   --target PKG       Target package for NC-1/NC-2 (default: sonic-utilities)
 #   --output-dir DIR   Results directory (default: ./poc-results/negative-controls/)
 #   --dry-run          Show what would be done without executing
@@ -176,7 +183,7 @@ usage() {
     echo ""
     echo "Options:"
     echo "  --cache-dir DIR     Cache directory with prior wcache artifacts (required)"
-    echo "  --test NC           Run specific test: NC-1, NC-2, NC-3, NC-4, NC-5, NC-6"
+    echo "  --test NC           Run specific test: NC-1, NC-2, NC-3, NC-4, NC-5, NC-6, NC-7"
     echo "  --target PKG        Target package (default: sonic-utilities)"
     echo "  --output-dir DIR    Output directory (default: ./poc-results/negative-controls/)"
     echo "  --full-build        Run actual Make builds to verify cache HIT/MISS (slower)"
