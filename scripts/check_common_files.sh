@@ -132,6 +132,9 @@ VERBOSE=false
 FIX_MODE=false
 
 # --- Findings tracking (matches audit_dep_completeness.sh format) ---
+# Use ASCII Unit Separator (0x1f) as the record delimiter instead of '|', so
+# finding text that legitimately contains '|' cannot corrupt the field split.
+readonly FINDING_FS=$'\037'
 FINDINGS=()
 FINDINGS_P0=0
 FINDINGS_P1=0
@@ -144,7 +147,7 @@ add_finding() {
     local issue="$3"
     local suggestion="$4"
 
-    FINDINGS+=("$severity|$component|$issue|$suggestion")
+    FINDINGS+=("${severity}${FINDING_FS}${component}${FINDING_FS}${issue}${FINDING_FS}${suggestion}")
 
     case $severity in
         P0) ((FINDINGS_P0++)) ;;
@@ -484,7 +487,7 @@ else
     IFS=$'\n' sorted=($(sort <<< "${FINDINGS[*]}")); unset IFS
 
     for finding in "${sorted[@]}"; do
-        IFS='|' read -r sev comp issue suggestion <<< "$finding"
+        IFS=$FINDING_FS read -r sev comp issue suggestion <<< "$finding"
         color="$NC"
         case $sev in
             P0) color="$RED" ;;
