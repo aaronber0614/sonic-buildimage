@@ -126,8 +126,8 @@
 #   inspects WHAT a conditional block DOES rather than matching flag names. A block is
 #   "build-affecting" only if it touches a stable SONiC build variable (see
 #   BUILD_SIGNAL_RE: *_DEPENDS/_RDEPENDS/_DBG_PACKAGES/_EXTRA_DEBS/_DERIVED_DEBS/
-#   _SRC_PATH/_BUILD_ENV/_MAKE_ENV/_CFLAGS/_MAKE_TARGET, dpkg-buildpackage,
-#   DEB_BUILD_OPTIONS). Blocks that only select/assemble packages (SONIC_MAKE_DEBS,
+#   _SRC_PATH/_BUILD_ENV/_MAKE_ENV/_CFLAGS/_MAKE_TARGET, add_derived_package /
+#   add_extra_package, dpkg-buildpackage, DEB_BUILD_OPTIONS). Blocks that only select/assemble packages (SONIC_MAKE_DEBS,
 #   SONIC_INSTALL_DOCKER_IMAGES, SONIC_PACKAGES_LOCAL, DEFAULT_FEATURE_STATE/OWNER)
 #   carry no build signal and are classified assembly-only (not a gap). These naming
 #   conventions are fixed by Makefile.cache/slave.mk, so the audit needs no upkeep as
@@ -260,10 +260,14 @@ json_escape() {
 
 # A conditional block is "build-affecting" if it assigns to a package build
 # input: dependency lists, derived/extra/dbg debs, source paths, build env/flags,
-# or runs a build recipe. Blocks that only touch image-assembly / installer /
-# feature-inclusion variables (e.g. SONIC_INSTALL_DOCKER_IMAGES, *_DOCKERS,
-# SONIC_PACKAGES*, DEFAULT_FEATURE_*) do NOT match and are treated as cosmetic.
-readonly BUILD_SIGNAL_RE='_(DEPENDS|RDEPENDS|DBG_DEPENDS|DBG_PACKAGES|EXTRA_DEBS|DERIVED_DEBS|SRC_PATH|BUILD_ENV|MAKE_ENV|CFLAGS|MAKE_TARGET)[[:space:]+:=]|dpkg-buildpackage|DEB_BUILD_OPTIONS'
+# or runs a build recipe. It is ALSO build-affecting if it registers a derived or
+# extra package via the add_derived_package / add_extra_package helpers (which
+# expand to *_DERIVED_DEBS / *_EXTRA_DEBS and change a package's cached payload) —
+# matched explicitly because the helper call site does not contain the literal
+# *_DERIVED_DEBS/*_EXTRA_DEBS token. Blocks that only touch image-assembly /
+# installer / feature-inclusion variables (e.g. SONIC_INSTALL_DOCKER_IMAGES,
+# *_DOCKERS, SONIC_PACKAGES*, DEFAULT_FEATURE_*) do NOT match and are cosmetic.
+readonly BUILD_SIGNAL_RE='_(DEPENDS|RDEPENDS|DBG_DEPENDS|DBG_PACKAGES|EXTRA_DEBS|DERIVED_DEBS|SRC_PATH|BUILD_ENV|MAKE_ENV|CFLAGS|MAKE_TARGET)[[:space:]+:=]|add_(derived|extra)_package|dpkg-buildpackage|DEB_BUILD_OPTIONS'
 
 # Print the ifeq/ifneq($(flag)...) ... endif block(s) that reference $flag in $file.
 # Captures ALL such blocks (not just the first) and tolerates nested conditionals
