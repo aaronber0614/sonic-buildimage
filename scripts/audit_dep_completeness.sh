@@ -20,7 +20,7 @@
 #   - Source directories (whether packages have source code at all)
 #
 # ═══════════════════════════════════════════════════════════════════════════════
-# WHAT IT CHECKS (8 checks)
+# WHAT IT CHECKS (9 checks)
 # ═══════════════════════════════════════════════════════════════════════════════
 #
 # Check 1: Packages registered in build categories without a .dep file
@@ -54,6 +54,12 @@
 # Check 8: slave.mk flags used in package build rules but not tracked
 #           Scans for flags like SONIC_BUILD_JOBS, ENABLE_SYNCD_RPC that are
 #           used in conditionals but not in SONIC_COMMON_FLAGS_LIST or DEP_FLAGS.
+#
+# Check 9: Nested derived packages not covered by cache save/restore
+#           add_derived_package(X, Y) only adds Y to X's first-level
+#           _DERIVED_DEBS, and the cache save does not recurse. If X is itself a
+#           derived deb, Y is dropped from the top-level package's cache tarball.
+#           Confirmed by negative control NC-6 (libnl3 nested derived debs).
 #
 # ═══════════════════════════════════════════════════════════════════════════════
 # USAGE
@@ -152,6 +158,11 @@ GREEN='\033[0;32m'
 CYAN='\033[0;36m'
 NC='\033[0m' # No Color
 
+# Internal field separator for FINDINGS records. Uses ASCII Unit Separator
+# (0x1f) instead of '|' because finding text (e.g. grep -Ev "a|b" exclusion
+# patterns) can legitimately contain '|', which would corrupt the split.
+readonly FINDING_FS=$'\037'
+
 # Counters
 TOTAL_DEP_FILES=0
 FINDINGS_P0=0
@@ -211,7 +222,7 @@ add_finding() {
     local issue="$3"
     local suggestion="$4"
 
-    FINDINGS+=("$severity|$package|$issue|$suggestion")
+    FINDINGS+=("${severity}${FINDING_FS}${package}${FINDING_FS}${issue}${FINDING_FS}${suggestion}")
 
     case $severity in
         P0) ((FINDINGS_P0++)) ;;
@@ -219,6 +230,15 @@ add_finding() {
         P2) ((FINDINGS_P2++)) ;;
         P3) ((FINDINGS_P3++)) ;;
     esac
+}
+
+# Escape a string for safe embedding inside a JSON double-quoted value.
+json_escape() {
+    local s="$1"
+    s="${s//\\/\\\\}"   # backslash first
+    s="${s//\"/\\\"}"   # then double quotes
+    s="${s//	/\\t}"    # literal tab -> \t
+    printf '%s' "$s"
 }
 
 # --- Check 1: Missing .dep files ---
@@ -341,9 +361,12 @@ check_dep_flags_coverage() {
         mk_flags+=$'\n'
         mk_flags+=$(grep -oP '(?<=ifneq \(\$\()[\w]+(?=\))' "$mk_file" 2>/dev/null || true)
 
-        # Filter to ENABLE_* and INCLUDE_* flags (build-affecting)
+        # Filter to build-affecting flags. INSTALL_ is included so that
+        # INSTALL_DEBUG_TOOLS (which adds debug packages to docker image content,
+        # e.g. docker-base _DBG_PACKAGES) is evaluated; the install_only filter
+        # below still suppresses cases where it merely selects an image to ship.
         local build_flags
-        build_flags=$(echo "$mk_flags" | grep -E "^(ENABLE_|INCLUDE_|SONIC_)" | sort -u)
+        build_flags=$(echo "$mk_flags" | grep -E "^(ENABLE_|INCLUDE_|INSTALL_|SONIC_)" | sort -u)
 
         if [[ -z "$build_flags" ]]; then
             log_verbose "$base: No conditional build flags in .mk"
@@ -616,7 +639,7 @@ check_common_flags_completeness() {
         "SONIC_BUILD_JOBS"
         "SONIC_CONFIG_MAKE_JOBS"
         "SONIC_CONFIG_USE_CCACHE"
-        "SONIC_INSTALL_DEBUG_TOOLS"
+        "SONIC_INSTALL_DEBUG_TOOLS"  # slave.mk-level: only drives debug-IMAGE assembly. Its per-package content impact (docker-base _DBG_PACKAGES) is caught by Check 3 as INSTALL_DEBUG_TOOLS.
         "SONIC_INCLUDE_MUX"
         "SONIC_INCLUDE_NAT"
         "SONIC_INCLUDE_SFLOW"
@@ -690,6 +713,59 @@ check_common_flags_completeness() {
     fi
 }
 
+# --- Check 9: Nested derived packages (cache save/restore completeness) ---
+# add_derived_package(X, Y) only appends Y to X's first-level _DERIVED_DEBS.
+# The cache save logic (Makefile.cache) tars the MAIN package plus its
+# _DERIVED_DEBS only — it does NOT recurse. If X is itself a derived package
+# (i.e. X appeared as the child/2nd arg of another add_derived_package call),
+# then Y lives under X's _DERIVED_DEBS, not the top-level main package's, so Y
+# is silently dropped from the cache tarball. A cache HIT then restores the
+# main deb and its first-level derived debs but MISSES the nested ones.
+# This is the exact class of bug confirmed by negative control NC-6 (libnl3).
+check_nested_derived_packages() {
+    echo -e "\n${CYAN}=== Check 9: Nested derived packages (cache completeness) ===${NC}"
+
+    local found=0
+    local mk
+    for mk in "$RULES_DIR"/*.mk; do
+        [[ -f "$mk" ]] || continue
+        grep -q 'add_derived_package' "$mk" || continue
+        if [[ -n "$FILTER_PACKAGE" && "$(basename "$mk" .mk)" != "$FILTER_PACKAGE" ]]; then
+            continue
+        fi
+
+        # Build PARENT,CHILD pairs from each add_derived_package(parent, child) call
+        local pairs
+        pairs=$(grep -oE 'add_derived_package,[^,]+,[^)]+\)' "$mk" \
+            | sed -E 's/add_derived_package,//' | tr -d ' $()')
+        [[ -z "$pairs" ]] && continue
+
+        local parents children
+        parents=$(echo "$pairs" | cut -d, -f1 | sort -u)
+        children=$(echo "$pairs" | cut -d, -f2 | sort -u)
+
+        local p
+        for p in $parents; do
+            [[ -z "$p" ]] && continue
+            # A parent that is also a child = nested derivation
+            if echo "$children" | grep -qxF "$p"; then
+                local grandchildren
+                grandchildren=$(echo "$pairs" | awk -F, -v par="$p" '$1==par {print $2}' \
+                    | sort -u | tr '\n' ' ')
+                add_finding "P1" "$(basename "$mk" .mk)" \
+                    "Nested add_derived_package: \$$p is itself a derived deb; its derived debs ($grandchildren) are absent from the top-level package _DERIVED_DEBS and may be dropped from cache save/restore" \
+                    "Register nested derived debs against the top-level main package, or confirm coverage with negative control NC-6"
+                echo -e "  ${RED}GAP${NC}: $(basename "$mk"): nested parent \$$p -> derived debs: $grandchildren"
+                ((found++))
+            fi
+        done
+    done
+
+    if [[ $found -eq 0 ]]; then
+        echo -e "  ${GREEN}None — no nested add_derived_package chains found${NC}"
+    fi
+}
+
 # --- Output Results ---
 print_summary() {
     echo -e "\n${CYAN}============================================${NC}"
@@ -718,7 +794,7 @@ print_summary() {
     IFS=$'\n' sorted=($(sort <<< "${FINDINGS[*]}")); unset IFS
 
     for finding in "${sorted[@]}"; do
-        IFS='|' read -r sev pkg issue suggestion <<< "$finding"
+        IFS=$FINDING_FS read -r sev pkg issue suggestion <<< "$finding"
         local color="$NC"
         case $sev in
             P0) color="$RED" ;;
@@ -732,14 +808,15 @@ print_json() {
     echo "["
     local first=true
     for finding in "${FINDINGS[@]}"; do
-        IFS='|' read -r sev pkg issue suggestion <<< "$finding"
+        IFS=$FINDING_FS read -r sev pkg issue suggestion <<< "$finding"
         if $first; then
             first=false
         else
             echo ","
         fi
         printf '  {"severity": "%s", "package": "%s", "issue": "%s", "suggestion": "%s"}' \
-            "$sev" "$pkg" "$issue" "$suggestion"
+            "$(json_escape "$sev")" "$(json_escape "$pkg")" \
+            "$(json_escape "$issue")" "$(json_escape "$suggestion")"
     done
     echo ""
     echo "]"
@@ -747,6 +824,12 @@ print_json() {
 
 # --- Main ---
 main() {
+    # In JSON mode, route all human-readable progress to stderr so that stdout
+    # carries only the JSON payload (emitted by print_json after restoring fd 1).
+    if $JSON_OUTPUT; then
+        exec 3>&1 1>&2
+    fi
+
     echo -e "${CYAN}╔══════════════════════════════════════════════════════════════╗${NC}"
     echo -e "${CYAN}║  SONiC DPKG Cache — Dependency Tracking Completeness Audit  ║${NC}"
     echo -e "${CYAN}╚══════════════════════════════════════════════════════════════╝${NC}"
@@ -776,9 +859,11 @@ main() {
     check_cache_modes
     check_docker_dep_tracking
     check_common_flags_completeness
+    check_nested_derived_packages
 
     # Output
     if $JSON_OUTPUT; then
+        exec 1>&3 3>&-   # restore stdout for the JSON payload
         print_json
     else
         print_summary
