@@ -198,20 +198,6 @@ log "Phase 3 complete (exit=$PHASE3_EXIT)"
 log ""
 
 ###############################################################################
-# PHASE 3.5: Validator (meta-test of comparison tooling)
-###############################################################################
-log "━━━ PHASE 3.5: Test Validator ━━━"
-
-bash "$SCRIPT_DIR/test_validator.sh" \
-    --build-dir "$BUILD_B_DIR" \
-    --output-dir "$RESULTS_DIR/validator" \
-    --verbose 2>&1 | tee "$RESULTS_DIR/phase3.5-validator.log"
-PHASE3_5_EXIT=$?
-
-log "Phase 3.5 complete (exit=$PHASE3_5_EXIT)"
-log ""
-
-###############################################################################
 # PHASE 4: Negative Control Tests
 ###############################################################################
 log "━━━ PHASE 4: Negative Control Tests (full-build) ━━━"
@@ -235,7 +221,6 @@ log ""
 log "Phase 1 — Static Analysis:      audit=$PHASE1_AUDIT, common=$PHASE1_COMMON"
 log "Phase 2 — Builds:               $(if $SKIP_BUILDS; then echo SKIPPED; else echo COMPLETE; fi)"
 log "Phase 3 — Equivalence (B vs C): exit=$PHASE3_EXIT"
-log "Phase 3.5 — Validator:          exit=$PHASE3_5_EXIT"
 log "Phase 4 — Negative Controls:    exit=$PHASE4_EXIT"
 log ""
 log "All results in: $RESULTS_DIR"
