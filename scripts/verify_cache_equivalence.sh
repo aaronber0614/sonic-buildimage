@@ -2108,21 +2108,18 @@ compare_installer_deep() {
                     record_result "$name" "SEMANTIC" "Decompressed content differs ($size_a bytes); squashfs extraction unavailable for deeper analysis"
                 fi
             else
+                # Different decompressed image size with no way to extract the
+                # squashfs payload. The raw installer image size is deterministic,
+                # so ANY size delta is evidence of a real content change — we
+                # cannot prove it cosmetic without payload inspection. Flag
+                # SEMANTIC rather than masking small deltas as "alignment".
                 local size_diff pct_diff
                 size_diff=$((size_a > size_b ? size_a - size_b : size_b - size_a))
-                # If size difference > 0.1% of image size, flag as semantic
                 local larger=$((size_a > size_b ? size_a : size_b))
                 pct_diff=$(python3 -c "print(f'{100*$size_diff/$larger:.2f}')" 2>/dev/null || echo "0")
-                local threshold_met
-                threshold_met=$(python3 -c "print('yes' if $size_diff > $larger * 0.001 else 'no')" 2>/dev/null || echo "no")
-                if [[ "$threshold_met" == "yes" ]]; then
-                    echo "SEMANTIC (size diff: $size_diff bytes / ${pct_diff}%)"
-                    record_result "$name" "SEMANTIC" "Decompressed size differs by $size_diff bytes (${pct_diff}%); installer payload extraction unavailable"
-                    has_semantic=true
-                else
-                    echo "COSMETIC (size diff: $size_diff bytes — likely padding/alignment)"
-                    record_result "$name" "COSMETIC" "Decompressed size differs by $size_diff bytes; within alignment tolerance"
-                fi
+                echo "SEMANTIC (size diff: $size_diff bytes / ${pct_diff}%, extraction unavailable)"
+                record_result "$name" "SEMANTIC" "Decompressed size differs by $size_diff bytes (${pct_diff}%); squashfs extraction unavailable to prove equivalence"
+                has_semantic=true
             fi
             rm -rf "$tmp_a" "$tmp_b"
             return
