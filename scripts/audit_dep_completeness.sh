@@ -61,6 +61,12 @@
 #           derived deb, Y is dropped from the top-level package's cache tarball.
 #           Confirmed by negative control NC-6 (libnl3 nested derived debs).
 #
+# Check 10: Exported build-env flags not tracked in any cache key
+#           Flags passed via `export FLAG` (not an ifeq($(FLAG)) conditional) are
+#           consumed inside debian/rules or sub-Makefiles, so the ifeq-based
+#           Checks 3 and 8 cannot see them. Closes the "export-only" blind spot
+#           (e.g. ENABLE_FRR_TCMALLOC on frr, whose _DEP_FLAGS is common-only).
+#
 # ═══════════════════════════════════════════════════════════════════════════════
 # USAGE
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -787,6 +793,61 @@ check_nested_derived_packages() {
     fi
 }
 
+# --- Check 10: Exported build-env flags not tracked in any cache key ---
+# Some feature flags never appear in an ifeq($(FLAG)) conditional; they are simply
+# `export`ed from slave.mk / a rules/*.mk and consumed inside the package's
+# debian/rules (or a sub-make) to change how the binary is built. Because Checks 3
+# and 8 only inspect ifeq/ifneq blocks, an export-only flag that changes build
+# output but is absent from SONIC_COMMON_FLAGS_LIST and every per-package
+# *_DEP_FLAGS is invisible to them — flipping it would silently reuse a stale
+# cached artifact. This check enumerates exported ENABLE_/INCLUDE_/EXTERNAL_/
+# INSTALL_ flags and reports those tracked in no cache key. It is intentionally
+# conservative (P2 "verify"): static analysis cannot prove the debian/rules
+# consumer changes output, only that the flag is a live, untracked build input.
+check_exported_flags() {
+    echo -e "\n${CYAN}=== Check 10: Exported build-env flags not in any cache key ===${NC}"
+
+    local exported
+    exported=$(grep -rhoP '^\s*export\s+\K(ENABLE_\w+|INCLUDE_\w+|EXTERNAL_\w+|INSTALL_\w+)' \
+        "$REPO_ROOT/slave.mk" "$RULES_DIR"/*.mk 2>/dev/null | sort -u)
+
+    local gap_count=0
+    while IFS= read -r flag; do
+        [[ -z "$flag" ]] && continue
+
+        # Already tracked in a cache key (common list or a per-package DEP_FLAGS)?
+        if flag_tracked_anywhere "$flag"; then
+            log_verbose "  $flag — tracked globally or per-package (OK)"
+            continue
+        fi
+        # Effectively dead — pinned off for all modern build envs?
+        if flag_forced_off_for_modern_bldenv "$flag"; then
+            log_verbose "  $flag — pinned off for modern BLDENV (dead)"
+            continue
+        fi
+        # Also used in a build-affecting ifeq? Then Check 3/8 already reports an
+        # actionable per-package finding — don't double-count it here.
+        if flag_affects_build "$flag"; then
+            log_verbose "  $flag — covered by ifeq-based Check 3/8"
+            continue
+        fi
+
+        ((gap_count++))
+        add_finding "P2" "$flag" \
+            "Exported into the build env (consumed in debian/rules or sub-make) but tracked in neither SONIC_COMMON_FLAGS_LIST nor any package DEP_FLAGS — a change is invisible to the cache key" \
+            "Confirm whether it changes build output; if so add \$($flag) to the DEP_FLAGS of each affected package (or SONIC_COMMON_FLAGS_LIST)"
+        if $VERBOSE; then
+            echo -e "  ${YELLOW}EXPORT-ONLY GAP${NC}: \$$flag exported but untracked in any cache key"
+        fi
+    done <<< "$exported"
+
+    if [[ $gap_count -eq 0 ]]; then
+        echo -e "  ${GREEN}None — all exported build flags are tracked or benign${NC}"
+    else
+        echo "  Found $gap_count exported build-env flag(s) not in any cache key"
+    fi
+}
+
 # --- Output Results ---
 print_summary() {
     echo -e "\n${CYAN}============================================${NC}"
@@ -884,6 +945,7 @@ main() {
     check_docker_dep_tracking
     check_common_flags_completeness
     check_nested_derived_packages
+    check_exported_flags
 
     # Output
     if $JSON_OUTPUT; then
