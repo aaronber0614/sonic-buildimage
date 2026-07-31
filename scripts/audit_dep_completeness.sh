@@ -164,6 +164,9 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 RULES_DIR="$REPO_ROOT/rules"
 PLATFORM_DIR="$REPO_ROOT/platform/${CONFIGURED_PLATFORM:-vs}"
 MAKEFILE_CACHE="$REPO_ROOT/Makefile.cache"
+EXPORT_REGISTRY="$SCRIPT_DIR/cache_key_export_registry.tsv"   # informational snapshot only
+EXPORT_SCANNER="$SCRIPT_DIR/cache_key_scan.py"
+EXPORT_WAIVERS="$SCRIPT_DIR/cache_key_export_waivers.tsv"     # human-justified safe exports
 
 # Colors for terminal output
 RED='\033[0;31m'
@@ -189,6 +192,10 @@ VERBOSE=false
 JSON_OUTPUT=false
 FILTER_PACKAGE=""
 FINDINGS=()
+DIFF_MODE=false
+DIFF_BASE=""
+DIFF_VARS_CACHE=""
+EXPORT_SCAN_CACHE=""
 
 # --- Argument Parsing ---
 while [[ $# -gt 0 ]]; do
@@ -205,14 +212,34 @@ while [[ $# -gt 0 ]]; do
             FILTER_PACKAGE="$2"
             shift 2
             ;;
+        --base|-b)
+            DIFF_MODE=true
+            DIFF_BASE="$2"
+            shift 2
+            ;;
+        --refresh-registry)
+            # Regenerate the comprehensive export registry from a whole-tree scan.
+            if [[ ! -f "$EXPORT_SCANNER" ]]; then
+                echo "Scanner not found: $EXPORT_SCANNER" >&2
+                exit 1
+            fi
+            exec python3 "$EXPORT_SCANNER"
+            ;;
         --help|-h)
-            echo "Usage: $0 [--verbose] [--json] [--package PKGNAME]"
+            echo "Usage: $0 [--verbose] [--json] [--package PKGNAME] [--base REF] [--refresh-registry]"
             echo ""
             echo "Options:"
-            echo "  --verbose, -v     Show detailed analysis for each .dep file"
-            echo "  --json            Output findings as JSON (for programmatic consumption)"
-            echo "  --package, -p     Only audit a specific package (e.g., 'swss')"
-            echo "  --help, -h        Show this help"
+            echo "  --verbose, -v      Show detailed analysis for each .dep file"
+            echo "  --json             Output findings as JSON (for programmatic consumption)"
+            echo "  --package, -p      Only audit a specific package (e.g., 'swss')"
+            echo "  --base, -b REF     PR/diff mode: only judge packages and exported build"
+            echo "                     variables changed since git REF (e.g. origin/master)."
+            echo "                     Any not-provably-safe export the PR touches -> P0."
+            echo "  --refresh-registry Write an informational snapshot of the live export"
+            echo "                     classification to scripts/cache_key_export_registry.tsv"
+            echo "                     (scripts/cache_key_scan.py) and exit. The gate itself"
+            echo "                     classifies LIVE and does not depend on this snapshot."
+            echo "  --help, -h         Show this help"
             exit 0
             ;;
         *)
@@ -244,6 +271,49 @@ add_finding() {
         P2) ((FINDINGS_P2++)) ;;
         P3) ((FINDINGS_P3++)) ;;
     esac
+}
+
+# Run the comprehensive whole-tree scanner ONCE (live) and cache its output. The
+# gate classifies on every run from live code — there is no committed trust-store
+# to drift out of date. Output rows: variable<TAB>disposition<TAB>evidence.
+compute_export_scan() {
+    [[ -n "$EXPORT_SCAN_CACHE" ]] && return 0
+    [[ -f "$EXPORT_SCANNER" ]] || return 1
+    EXPORT_SCAN_CACHE=$(python3 "$EXPORT_SCANNER" --stdout 2>/dev/null)
+    [[ -n "$EXPORT_SCAN_CACHE" ]]
+}
+
+# Echo the human-recorded justification if $1 is waived in cache_key_export_waivers.tsv
+# (variable<TAB>reason, '#' comments ignored), else nothing. A waiver is the ONLY
+# way a not-provably-safe export is cleared, and it must carry a reason.
+waiver_reason() {
+    [[ -f "$EXPORT_WAIVERS" ]] || return 0
+    awk -F'\t' -v v="$1" '!/^[[:space:]]*#/ && $1==v {print $2; exit}' "$EXPORT_WAIVERS"
+}
+
+# Populate DIFF_VARS_CACHE with the set of build-env variables the diff touches:
+# any variable whose `export`/assignment/use lines were added or removed between
+# DIFF_BASE and the working tree in slave.mk / rules/*.mk / Makefile.cache. Used
+# by --base (PR) mode to scope Check 10 to what the PR actually changes.
+compute_diff_vars() {
+    $DIFF_MODE || return 0
+    local range="$DIFF_BASE"
+    # Resolve a merge-base when given a branch ref, so we only see PR-local changes.
+    if git -C "$REPO_ROOT" rev-parse --verify -q "$DIFF_BASE" >/dev/null 2>&1; then
+        local mb; mb=$(git -C "$REPO_ROOT" merge-base "$DIFF_BASE" HEAD 2>/dev/null)
+        [[ -n "$mb" ]] && range="$mb"
+    fi
+    DIFF_VARS_CACHE=$(git -C "$REPO_ROOT" diff --unified=0 "$range" -- \
+            slave.mk 'rules/*.mk' Makefile.cache 2>/dev/null \
+        | grep -E '^[-+]' | grep -vE '^[-+]{3} ' \
+        | grep -oP '(?:export\s+|\$\()\K[A-Za-z_][A-Za-z0-9_]*' \
+        | sort -u)
+    log_verbose "diff-mode variables touched since $DIFF_BASE: $(echo "$DIFF_VARS_CACHE" | tr '\n' ' ')"
+}
+
+# True (0) if $1 is one of the variables the diff touched (see compute_diff_vars).
+diff_touches_var() {
+    grep -qx "$1" <<< "$DIFF_VARS_CACHE"
 }
 
 # Escape a string for safe embedding inside a JSON double-quoted value.
@@ -308,12 +378,11 @@ flag_affects_build() {
     return 1
 }
 
-# True (0) if $flag is tracked in some cache key: SONIC_COMMON_FLAGS_LIST (with or
-# without SONIC_ prefix) or any per-package *_DEP_FLAGS in rules/*.dep.
+# True (0) if $flag is tracked in some cache key: SONIC_COMMON_FLAGS_LIST or any
+# per-package *_DEP_FLAGS in rules/*.dep.
 flag_tracked_anywhere() {
     local flag="$1"
-    if echo "$COMMON_FLAGS_LIST_CACHE" | grep -qx "$flag" || \
-       echo "$COMMON_FLAGS_LIST_CACHE" | grep -qx "SONIC_${flag}"; then
+    if echo "$COMMON_FLAGS_LIST_CACHE" | grep -qx "$flag"; then
         return 0
     fi
     grep -lE "_DEP_FLAGS" "$RULES_DIR"/*.dep 2>/dev/null \
@@ -793,59 +862,111 @@ check_nested_derived_packages() {
     fi
 }
 
-# --- Check 10: Exported build-env flags not tracked in any cache key ---
-# Some feature flags never appear in an ifeq($(FLAG)) conditional; they are simply
-# `export`ed from slave.mk / a rules/*.mk and consumed inside the package's
-# debian/rules (or a sub-make) to change how the binary is built. Because Checks 3
-# and 8 only inspect ifeq/ifneq blocks, an export-only flag that changes build
-# output but is absent from SONIC_COMMON_FLAGS_LIST and every per-package
-# *_DEP_FLAGS is invisible to them — flipping it would silently reuse a stale
-# cached artifact. This check enumerates exported ENABLE_/INCLUDE_/EXTERNAL_/
-# INSTALL_ flags and reports those tracked in no cache key. It is intentionally
-# conservative (P2 "verify"): static analysis cannot prove the debian/rules
-# consumer changes output, only that the flag is a live, untracked build input.
+# --- Check 10: Exported build-env variables vs the cache key (live whole-tree scan) ---
+# Some build inputs never appear in an ifeq($(FLAG)) conditional; they are simply
+# `export`ed from slave.mk / a rules/*.mk and consumed inside a package's
+# debian/rules, source Makefile, or Dockerfile.j2 — or read straight from the
+# environment by an external tool (docker, cargo, dpkg). Checks 3/8 only inspect
+# ifeq/ifneq blocks, so such an export-only input that changes build output but is
+# absent from SONIC_COMMON_FLAGS_LIST and every per-package *_DEP_FLAGS is invisible
+# to them — flipping it silently reuses a stale cached artifact (the
+# DOCKER_DEFAULT_PLATFORM class of bug).
+#
+# DESIGN: NO name heuristics, NO reliance on the Tier-2 rebuild, NO committed
+# trust-store that can drift. scripts/cache_key_scan.py enumerates EVERY exported
+# variable from live git-tracked source and classifies each by concrete evidence:
+#   in-key    -> literally in SONIC_COMMON_FLAGS_LIST / a *_DEP_FLAGS. PROVABLY safe.
+#   filename  -> value flows into a cached target's *.deb/*.whl/*.gz name. PROVABLY safe.
+#   gap       -> referenced by a cached build recipe but untracked. REPORTED (P1).
+#   assembly  -> referenced in the make/assembly layer, no cached-recipe consumer.
+#                NOT provably safe (can still reach a cached `docker build`). REPORTED (P2).
+#   external-env -> exported, NO in-repo consumer (read from the env by an external
+#                tool). Cannot be proven safe by static analysis. REPORTED (P2).
+# Only in-key/filename auto-clear (both recomputed live). Everything else is a
+# finding (default-deny). A human clears a specific variable by recording it — WITH
+# A REASON — in scripts/cache_key_export_waivers.tsv.
+#
+# PR/diff mode (--base REF): any not-provably-safe, un-waived export the PR TOUCHES
+# is escalated to P0 (a hard gate) — this is exactly how DOCKER_DEFAULT_PLATFORM
+# would be caught on the PR that introduces it. A full run (no --base) reports the
+# whole standing problem set: gap=P1, assembly/external-env=P2.
 check_exported_flags() {
-    echo -e "\n${CYAN}=== Check 10: Exported build-env flags not in any cache key ===${NC}"
+    echo -e "\n${CYAN}=== Check 10: Exported build-env variables vs cache key (live scan) ===${NC}"
 
-    local exported
-    exported=$(grep -rhoP '^\s*export\s+\K(ENABLE_\w+|INCLUDE_\w+|EXTERNAL_\w+|INSTALL_\w+)' \
-        "$REPO_ROOT/slave.mk" "$RULES_DIR"/*.mk 2>/dev/null | sort -u)
-
-    local gap_count=0
-    while IFS= read -r flag; do
-        [[ -z "$flag" ]] && continue
-
-        # Already tracked in a cache key (common list or a per-package DEP_FLAGS)?
-        if flag_tracked_anywhere "$flag"; then
-            log_verbose "  $flag — tracked globally or per-package (OK)"
-            continue
-        fi
-        # Effectively dead — pinned off for all modern build envs?
-        if flag_forced_off_for_modern_bldenv "$flag"; then
-            log_verbose "  $flag — pinned off for modern BLDENV (dead)"
-            continue
-        fi
-        # Also used in a build-affecting ifeq? Then Check 3/8 already reports an
-        # actionable per-package finding — don't double-count it here.
-        if flag_affects_build "$flag"; then
-            log_verbose "  $flag — covered by ifeq-based Check 3/8"
-            continue
-        fi
-
-        ((gap_count++))
-        add_finding "P2" "$flag" \
-            "Exported into the build env (consumed in debian/rules or sub-make) but tracked in neither SONIC_COMMON_FLAGS_LIST nor any package DEP_FLAGS — a change is invisible to the cache key" \
-            "Confirm whether it changes build output; if so add \$($flag) to the DEP_FLAGS of each affected package (or SONIC_COMMON_FLAGS_LIST)"
-        if $VERBOSE; then
-            echo -e "  ${YELLOW}EXPORT-ONLY GAP${NC}: \$$flag exported but untracked in any cache key"
-        fi
-    done <<< "$exported"
-
-    if [[ $gap_count -eq 0 ]]; then
-        echo -e "  ${GREEN}None — all exported build flags are tracked or benign${NC}"
-    else
-        echo "  Found $gap_count exported build-env flag(s) not in any cache key"
+    if ! compute_export_scan; then
+        add_finding "P1" "cache_key_scan.py" \
+            "Export scanner $EXPORT_SCANNER did not run — cannot verify exported build-env variables against the cache key" \
+            "Ensure python3 and scripts/cache_key_scan.py are present; run: $0 --refresh-registry to test it"
+        echo -e "  ${YELLOW}Scanner unavailable${NC}"
+        return
     fi
+
+    local gap_count=0 unproven_count=0 p0_count=0 waived_count=0
+    while IFS=$'\t' read -r flag disp ev; do
+        [[ -z "$flag" ]] && continue
+        # In diff mode, only judge variables the PR actually touches.
+        if $DIFF_MODE && ! diff_touches_var "$flag"; then
+            continue
+        fi
+
+        # Provably cache-safe — no finding.
+        case "$disp" in
+            in-key|filename)
+                log_verbose "  $flag — $disp (provably cache-safe)"
+                continue
+                ;;
+        esac
+        # Belt-and-suspenders: honor a live cache-key membership too.
+        if flag_tracked_anywhere "$flag"; then
+            log_verbose "  $flag — tracked in a cache key (OK)"
+            continue
+        fi
+
+        # Human-justified waiver — the only way a not-provable export is cleared.
+        local reason
+        reason=$(waiver_reason "$flag")
+        if [[ -n "$reason" ]]; then
+            ((waived_count++))
+            log_verbose "  $flag — waived: $reason"
+            add_finding "P3" "$flag" \
+                "Exported build-env variable waived from cache-key tracking (human-justified): $reason" \
+                "Re-verify the waiver reason still holds if this variable's build usage changes"
+            continue
+        fi
+
+        # A real finding. Standing severity by evidence strength; PR-touched -> P0.
+        local sev msg
+        if $DIFF_MODE; then
+            sev="P0"; ((p0_count++))
+        elif [[ "$disp" == "gap" ]]; then
+            sev="P1"; ((gap_count++))
+        else
+            sev="P2"; ((unproven_count++))
+        fi
+        case "$disp" in
+            gap)
+                msg="Exported and consumed by a cached build recipe (${ev:-recipe}) but tracked in neither SONIC_COMMON_FLAGS_LIST nor any package DEP_FLAGS — changing it alters the built artifact without flipping the cache key (stale-cache risk)"
+                ;;
+            assembly)
+                msg="Exported into the build environment (referenced in the make/assembly layer) but not tracked in any cache key and not provably cache-safe — an assembly-layer variable can still reach a 'docker build' whose image is cached (the DOCKER_DEFAULT_PLATFORM class)"
+                ;;
+            *)
+                msg="Exported into the build environment with NO in-repo consumer — it is read straight from the environment by an external build tool (docker/cargo/dpkg/...), which static analysis cannot see inside, so it cannot be proven cache-safe (the DOCKER_DEFAULT_PLATFORM class)"
+                ;;
+        esac
+        add_finding "$sev" "$flag" "$msg" \
+            "If it can affect any cached artifact, add \$($flag) to SONIC_COMMON_FLAGS_LIST or the relevant package DEP_FLAGS. If it provably cannot, record it (with a reason) in scripts/cache_key_export_waivers.tsv."
+        $VERBOSE && echo -e "  ${RED}$sev${NC} \$$flag ($disp${ev:+: $ev})"
+    done <<< "$EXPORT_SCAN_CACHE"
+
+    if [[ $((gap_count + unproven_count + p0_count)) -eq 0 ]]; then
+        echo -e "  ${GREEN}None — every exported build variable is provably cache-safe or waived${NC}"
+    else
+        [[ $p0_count -gt 0 ]] && echo -e "  ${RED}$p0_count PR-introduced untracked export(s) (P0)${NC}"
+        [[ $gap_count -gt 0 ]] && echo -e "  ${YELLOW}$gap_count exported var(s) consumed by a cached recipe but untracked (P1)${NC}"
+        [[ $unproven_count -gt 0 ]] && echo "  $unproven_count exported var(s) not provably cache-safe — review or waive (P2)"
+    fi
+    [[ $waived_count -gt 0 ]] && log_verbose "$waived_count exported var(s) cleared by recorded waivers"
 }
 
 # --- Output Results ---
@@ -934,6 +1055,7 @@ main() {
 
     # Precompute the global flag list once for the data-driven classifiers.
     compute_common_flags_list
+    compute_diff_vars
 
     # Run all checks
     check_missing_dep_files
