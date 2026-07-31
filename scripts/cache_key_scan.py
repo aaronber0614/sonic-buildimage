@@ -68,6 +68,10 @@ REF_RE = re.compile(r"\$\((\w+)\)|\$\{(\w+)\}|\$(\w+)")
 # prerequisite or a recipe command on the same line - while still spanning the
 # parentheses of an embedded $(VAR).
 FN_TOKEN_RE = re.compile(r"[^\s:;=|&<>'\"]*\.(?:deb|whl|gz)\b")
+# A make variable reference in EITHER syntax: $(VAR) or ${VAR}. Package .mk files
+# freely mix both (e.g. `foo_${VER}_${ARCH}.deb`), so var-ref extraction must not
+# be paren-only or it silently misses curly-brace refs and reports false gaps.
+VARREF_RE = re.compile(r"\$[({]\s*(\w+)\s*[})]")
 EXPORT_RE = re.compile(r"^\s*export\s+([A-Za-z_]\w*)", re.M)
 ASSIGN_RE = re.compile(r"^\s*([A-Za-z_]\w*)\s*[:?+]?=\s*(.*)$", re.M)
 # Unconditional (re)assignment of a variable inside a recipe: `VAR = x` / `VAR := x`
@@ -198,12 +202,12 @@ def tracked_vars():
     flags = set()
     for line in logical_lines(mk):
         if "SONIC_COMMON_FLAGS_LIST" in line:
-            flags |= set(re.findall(r"\$\((\w+)\)", line))
+            flags |= set(VARREF_RE.findall(line))
     for dep in git_files(recurse=False):
         if dep.endswith(".dep"):
             for line in logical_lines(read(dep)):
                 if re.search(r"DEP_FLAGS\s*[:+?]?=", line):
-                    flags |= set(re.findall(r"\$\((\w+)\)", line))
+                    flags |= set(VARREF_RE.findall(line))
     return flags
 
 
@@ -223,10 +227,10 @@ def filename_captured(producer_text_values):
     for t in producer_text_values:
         for line in t.splitlines():
             for tok in FN_TOKEN_RE.findall(line):
-                seed |= set(re.findall(r"\$\((\w+)\)", tok))
+                seed |= set(VARREF_RE.findall(tok))
         for m in ASSIGN_RE.finditer(t):
             lhs, rhs = m.group(1), m.group(2)
-            contributes[lhs] |= set(re.findall(r"\$\((\w+)\)", rhs))
+            contributes[lhs] |= set(VARREF_RE.findall(rhs))
             if FN_TOKEN_RE.search(rhs):     # RHS is itself an artifact filename
                 seed.add(lhs)
     captured = set(seed)
